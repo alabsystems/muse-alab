@@ -1,0 +1,15 @@
+muse-alab
+Copyright 2026 Andrew Yates
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+muse-alab runs Meta's Muse Code command-line program (`muse`) as a separate process. It
+does not include, modify or redistribute any part of that program; `muse` is installed and
+licensed separately, by its vendor's terms, through aterm's package manager. Muse Code is a
+name of its vendor.
+
+Parts of muse-alab follow aterm's source (Apache-2.0, the same author): the package store
+layout and build numbering of its package manager (crates/atpkg), and Muse Code's resume
+grammar, exit table, session witness and quiet-restart gates from its harness lanes
+(crates/aterm-agent/src/harness/upgrade_muse*.rs). The file and function each comes from
+is cited where it is used.

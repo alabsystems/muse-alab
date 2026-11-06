@@ -1,0 +1,52 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[workspace]
+members = ["."]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Andrew Yates"]
+
+# atpkg's Plain-program shape: the pack takes the version of the package named like the
+# program, and lays a shim for each exposed tool. The tool is never `muse`, the vendor's own
+# name (atpkg's vendor row already exposes that).
+[workspace.metadata.atpkg]
+expose = ["muse-alab"]
+
+[package]
+name = "muse-alab"
+description = "The ALab harness for Muse Code: runs the unmodified vendor CLI from the atpkg store as its child and moves it onto a newer build at a safe point"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "muse_alab"
+path = "src/lib.rs"
+
+[[bin]]
+name = "muse-alab"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+# The integration test is also the fake Muse Code it installs into its sandboxed store,
+# so it has its own `main` (tests/harness.rs).
+[[test]]
+name = "harness"
+path = "tests/harness.rs"
+harness = false

@@ -1,0 +1,7 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# ALab builds with the Trust toolchain (targo, trustc). This pin names no lane; each command
+# picks one: `targo --unverified <cmd>` (no proof claim) or `targo trust <cmd>` (verified).
+[toolchain]
+channel = "trust"
