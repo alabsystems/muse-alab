@@ -15,20 +15,52 @@
 //! | no tool is running | the child has no descendant processes ([`crate::procs`]) | `child-process`, `process-table` |
 //! | the session is known | exactly one session lock naming the child, written since it started ([`crate::muse::session::witness`]) | `no-session` |
 //! | the turn ended | Muse Code's own session log: no open run, task or queued item in this process's part, nor in its subagents' logs ([`crate::muse::log`], aterm's G-M1/G-M2) | `turn-open`, `open-task`, `background-work`, `queued-work`, `log-unproved`, `log-unreadable` |
-//! | the composer is empty | no terminal input since the last prompt was submitted (the last turn's start, else the process's start): what was typed before it went into that prompt | `draft-unproven` |
 //! | the turn has settled | the last turn ended at least `settle` ago | `turn-settling` |
+//! | the composer is empty | aterm's screen reader where aterm serves it (`status composer=`, read fresh at the act, [`crate::aterm::move_unheld`]), else no terminal input since the last prompt was submitted (the last turn's start, else the process's start) | `draft`, `composer-unproven`; `draft-unproven` |
 //!
-//! The composer witness needs no screen: a draft can only come from terminal input, and
-//! the terminal's access time is never earlier than the last read of input
-//! ([`crate::tty`]). It holds whenever that clock is later than the last submission — a
-//! key, a paste, a mouse or focus report, a terminal query's answer, or a submitting key
-//! whose read the kernel timed lazily (one in the same wall-clock second as the read
-//! before it) — even when the composer is in fact empty; then the restart waits for the
-//! next turn, or for the session's end (the next launch starts the newest build anyway).
-//! A prompt that arrives in one read (a paste, or aterm typing it) is timed exactly. aterm's
-//! screen reader (contract v3, [`crate::aterm`]) is the witness that will lift the rest.
+//! THE COMPOSER WITNESS ([`check_composer`]) is aterm's word where aterm serves it: its
+//! reader of the identified program says `empty`, `placeholder` (a tip or a suggestion, no
+//! person's text), `draft`, or `-` (no composer drawn, or its text not proven), and only the
+//! first two let the move go. An aterm that does not serve `composer=` (one that predates it,
+//! or none at all outside aterm) leaves the terminal's input clock, which needs no screen: a
+//! draft can only come from terminal input, and the terminal's access time is never earlier
+//! than the last read of input ([`crate::tty`]). That clock holds whenever it is later than
+//! the last submission — a key, a paste, a mouse or focus report, a terminal query's answer,
+//! or a submitting key whose read the kernel timed lazily (one in the same wall-clock second
+//! as the read before it) — even when the composer is in fact empty; then the restart waits
+//! for the next turn, or for the session's end (the next launch starts the newest build
+//! anyway). A prompt that arrives in one read (a paste, or aterm typing it) is timed exactly.
 
 use crate::muse::log::{Open, Quiet};
+
+/// What aterm's screen reader says the session's composer holds (`status composer=`, contract
+/// 3's §8.1 item 9 in aterm's harness design): read off the screen by the reader of the program
+/// aterm identified, so the harness judges a safe point without a screen reader of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Composer {
+    /// `composer=empty`: no typed or placeholder text.
+    Empty,
+    /// `composer=placeholder`: placeholder text (a tip or a suggestion), not a person's draft.
+    Placeholder,
+    /// `composer=draft`: a person's unsent draft.
+    Draft,
+    /// `composer=-`, or a word this harness does not know: no composer drawn, or its text not
+    /// proven either way.
+    Unproven,
+}
+
+impl Composer {
+    /// The word `composer=` carries.
+    #[must_use]
+    pub fn parse(word: &str) -> Composer {
+        match word {
+            "empty" => Composer::Empty,
+            "placeholder" => Composer::Placeholder,
+            "draft" => Composer::Draft,
+            _ => Composer::Unproven,
+        }
+    }
+}
 
 /// The safe point's clocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +105,8 @@ pub struct Look {
     pub children: Option<usize>,
     /// What its session's logs say.
     pub log: Result<Quiet, Open>,
+    /// aterm's `composer=`, where aterm serves it.
+    pub composer: Option<Composer>,
     /// Now (µs since the epoch).
     pub now_us: u64,
 }
@@ -130,25 +164,66 @@ pub fn check_children(children: Option<usize>) -> Result<(), &'static str> {
     }
 }
 
-/// Whether the turn ended, the composer is empty and the turn has settled.
+/// Whether the turn ended and has settled: the last submission it read (µs since the epoch),
+/// which the input clock's composer witness is judged against ([`ComposerWitness::InputClock`]).
 ///
 /// # Errors
-/// The log's word, `draft-unproven` or `turn-settling`.
+/// The log's word or `turn-settling`.
 pub fn check_log(
     log: &Result<Quiet, Open>,
-    last_input_us: Option<u64>,
     now_us: u64,
     timing: &Timing,
-) -> Result<(), &'static str> {
+) -> Result<u64, &'static str> {
     let quiet = log.as_ref().map_err(|o| o.word())?;
-    let last = last_input_us.ok_or("no-input-clock")?;
-    if last > quiet.submitted_us {
-        return Err("draft-unproven");
-    }
     if now_us.saturating_sub(quiet.ended_us) < timing.settle_us || quiet.ended_us > now_us {
         return Err("turn-settling");
     }
-    Ok(())
+    Ok(quiet.submitted_us)
+}
+
+/// What says the composer holds no person's text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComposerWitness {
+    /// aterm's screen reader (`status composer=`), where aterm serves it.
+    Aterm(Composer),
+    /// The terminal's input clock against the last submission: no input since it, so nothing
+    /// typed waits in the composer ([`crate::tty`]).
+    InputClock {
+        /// When the terminal last delivered input (`None`: unreadable).
+        last_input_us: Option<u64>,
+        /// When the last prompt was submitted (the last turn's start, else the process's).
+        submitted_us: u64,
+    },
+}
+
+impl ComposerWitness {
+    /// aterm's word where aterm serves one (`served`), else the input clock `local`.
+    #[must_use]
+    pub fn of(served: Option<Composer>, local: ComposerWitness) -> ComposerWitness {
+        served.map_or(local, ComposerWitness::Aterm)
+    }
+}
+
+/// Whether the composer holds no person's text, by `witness`: aterm's `empty` or
+/// `placeholder`, else no terminal input since the last submission.
+///
+/// # Errors
+/// `draft` or `composer-unproven` (aterm's word), `no-input-clock` or `draft-unproven` (the
+/// input clock).
+pub fn check_composer(witness: ComposerWitness) -> Result<(), &'static str> {
+    match witness {
+        ComposerWitness::Aterm(Composer::Empty | Composer::Placeholder) => Ok(()),
+        ComposerWitness::Aterm(Composer::Draft) => Err("draft"),
+        ComposerWitness::Aterm(Composer::Unproven) => Err("composer-unproven"),
+        ComposerWitness::InputClock {
+            last_input_us,
+            submitted_us,
+        } => match last_input_us {
+            None => Err("no-input-clock"),
+            Some(last) if last > submitted_us => Err("draft-unproven"),
+            Some(_) => Ok(()),
+        },
+    }
 }
 
 /// THE GATE: every check, in the order the live loop reads them (cheapest first).
@@ -160,12 +235,14 @@ pub fn gate(l: &Look, timing: &Timing) -> Result<(), &'static str> {
     check_terminal(l.terminal, l.now_us, timing)?;
     check_children(l.children)?;
     check_session(l.session.as_deref())?;
-    check_log(
-        &l.log,
-        l.terminal.and_then(|t| t.last_input_us),
-        l.now_us,
-        timing,
-    )
+    let submitted_us = check_log(&l.log, l.now_us, timing)?;
+    check_composer(ComposerWitness::of(
+        l.composer,
+        ComposerWitness::InputClock {
+            last_input_us: l.terminal.and_then(|t| t.last_input_us),
+            submitted_us,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -190,6 +267,7 @@ mod tests {
                 submitted_us: NOW - 599_000_000,
                 ended_us: NOW - 60_000_000,
             }),
+            composer: None,
             now_us: NOW,
         }
     }
@@ -278,6 +356,14 @@ mod tests {
             ended_us: NOW - 10_000_000,
         });
         cases.push((l, "turn-settling"));
+        for (word, composer) in [
+            ("draft", Composer::Draft),
+            ("composer-unproven", Composer::Unproven),
+        ] {
+            let mut l = quiet_look();
+            l.composer = Some(composer);
+            cases.push((l, word));
+        }
         for (look, word) in cases {
             assert_eq!(gate(&look, &T), Err(word), "{look:?}");
         }
@@ -306,5 +392,41 @@ mod tests {
             q.ended_us = NOW + 1;
         }
         assert_eq!(gate(&l, &T), Err("turn-settling"));
+    }
+
+    /// THE COMPOSER IS aterm's WORD WHERE aterm SERVES ONE: its `empty` or `placeholder` lets a
+    /// move go though the input clock is later than the last submission (input after it that
+    /// typed no draft, which that clock cannot tell from one), and its `draft` or `-` holds one
+    /// the input clock would let go. With no word served, the input clock judges.
+    #[test]
+    fn the_composer_is_aterms_word_where_aterm_serves_one() {
+        let mut clock_holds = quiet_look();
+        if let Ok(q) = &mut clock_holds.log {
+            q.submitted_us = NOW - 700_000_000;
+        }
+        assert_eq!(gate(&clock_holds, &T), Err("draft-unproven"));
+        for composer in [Composer::Empty, Composer::Placeholder] {
+            let mut l = clock_holds.clone();
+            l.composer = Some(composer);
+            assert_eq!(gate(&l, &T), Ok(()), "{composer:?}");
+        }
+        for (composer, word) in [
+            (Composer::Draft, "draft"),
+            (Composer::Unproven, "composer-unproven"),
+        ] {
+            let mut l = quiet_look();
+            l.composer = Some(composer);
+            assert_eq!(gate(&l, &T), Err(word), "{composer:?}");
+        }
+        assert_eq!(
+            check_composer(ComposerWitness::of(
+                None,
+                ComposerWitness::InputClock {
+                    last_input_us: None,
+                    submitted_us: NOW
+                }
+            )),
+            Err("no-input-clock")
+        );
     }
 }

@@ -32,6 +32,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use alab_wire::Scope;
+use alab_wire::fake::{FakeAterm, POLICY_ON};
+
 /// The harness under test.
 const HARNESS: &str = env!("CARGO_BIN_EXE_muse-alab");
 /// The harness's version.
@@ -46,8 +49,44 @@ const NEWER: &str = "1.4.14-R7000.0";
 const SESSION: &str = "01a148f8-9301-7752-96db-fef456f88074";
 /// tick, look, person grace, settle, stop wait (ms).
 const TIMING: &str = "50,100,300,200,3000";
-/// How long a test waits for something that must happen.
+/// How long a test waits for something that must happen: a deadline, not a window, so a
+/// passing test returns as soon as the condition holds and a loaded machine only slows it.
 const PATIENCE: Duration = Duration::from_secs(30);
+
+/// One of the harness's clocks as [`TIMING`] sets them: 0 the tick, 1 the look, 2 the person
+/// grace, 3 the settle, 4 the stop wait.
+fn clock(i: usize) -> Duration {
+    TIMING
+        .split(',')
+        .nth(i)
+        .and_then(|ms| ms.parse().ok())
+        .map(Duration::from_millis)
+        .expect("TIMING names the clock")
+}
+
+/// THE WINDOW A SIGNAL WOULD BE ACTED ON IN: the harness waits for its signals a tick at a
+/// time and wakes at once for a caught one, so a signal it acted on (or one that killed it)
+/// shows within a few ticks. An absence can only be proved by waiting, so this is a window:
+/// on a loaded machine it can only miss a fault, never fail a sound harness.
+fn signal_window() -> Duration {
+    clock(0) * 8
+}
+
+/// THE WINDOW A MOVE WOULD BE MADE IN: a quiet session is stopped at the first look after
+/// the settle and the person grace, so a harness that wrongly moves does it within one look
+/// past both. Three of those, as a window for an absence (see [`signal_window`]).
+fn move_window() -> Duration {
+    (clock(1) + clock(2) + clock(3)) * 3
+}
+
+/// The journal time (ms since the epoch) of the last line whose word is `word`.
+fn journal_ms(journal: &str, word: &str) -> Option<u64> {
+    let line = journal
+        .lines()
+        .rfind(|l| l.split(' ').nth(2) == Some(word))?;
+    let (s, ms) = line.split(' ').next()?.split_once('.')?;
+    Some(s.parse::<u64>().ok()? * 1000 + ms.parse::<u64>().ok()?)
+}
 
 fn main() {
     if fake::is_me() {
@@ -133,6 +172,16 @@ const TESTS: &[(&str, bool, fn())] = &[
         never_signals_again_a_child_that_outlived_its_stop,
     ),
     (
+        "a_stopped_childs_stop_wait_starts_again_when_it_is_continued",
+        true,
+        a_stopped_childs_stop_wait_starts_again_when_it_is_continued,
+    ),
+    (
+        "a_harness_continued_alone_starts_its_childs_stop_wait_again",
+        true,
+        a_harness_continued_alone_starts_its_childs_stop_wait_again,
+    ),
+    (
         "never_moves_onto_a_build_that_does_not_start",
         true,
         never_moves_onto_a_build_that_does_not_start,
@@ -143,9 +192,9 @@ const TESTS: &[(&str, bool, fn())] = &[
         never_stops_a_child_with_typing_unread,
     ),
     (
-        "relaunches_a_crashed_child_within_its_budget",
+        "relaunches_a_crashed_child_on_aterms_ladder",
         false,
-        relaunches_a_crashed_child_within_its_budget,
+        relaunches_a_crashed_child_on_aterms_ladder,
     ),
     (
         "a_crash_comes_back_on_the_build_it_ran_when_the_newest_does_not_start",
@@ -199,19 +248,104 @@ const TESTS: &[(&str, bool, fn())] = &[
         under_aterm_passes_through_where_no_claim_is_proven,
     ),
     (
-        "under_aterm_holds_the_session_by_a_proven_claim",
+        "under_aterm_an_aterm_busy_or_off_for_now_keeps_the_child_supervised_and_claims_later",
         false,
-        under_aterm_holds_the_session_by_a_proven_claim,
+        under_aterm_an_aterm_busy_or_off_for_now_keeps_the_child_supervised_and_claims_later,
     ),
     (
-        "under_aterm_a_crash_while_the_claim_lapsed_waits_for_it_and_is_relaunched",
+        "under_aterm_a_claim_follows_the_policy_off_and_back_on",
         false,
-        under_aterm_a_crash_while_the_claim_lapsed_waits_for_it_and_is_relaunched,
+        under_aterm_a_claim_follows_the_policy_off_and_back_on,
     ),
     (
-        "under_aterm_a_crash_is_passed_back_once_the_claim_stays_away_past_the_hold",
+        "under_aterm_holds_the_session_by_a_claim_and_relaunches_on_the_ladder",
         false,
-        under_aterm_a_crash_is_passed_back_once_the_claim_stays_away_past_the_hold,
+        under_aterm_holds_the_session_by_a_claim_and_relaunches_on_the_ladder,
+    ),
+    (
+        "under_aterm_a_crash_is_passed_on_when_aterm_says_relaunch_is_off",
+        false,
+        under_aterm_a_crash_is_passed_on_when_aterm_says_relaunch_is_off,
+    ),
+    (
+        "under_aterm_a_crash_while_aterm_is_away_waits_for_the_claim_and_is_relaunched",
+        false,
+        under_aterm_a_crash_while_aterm_is_away_waits_for_the_claim_and_is_relaunched,
+    ),
+    (
+        "under_aterm_a_crash_is_passed_on_once_aterm_stays_away_past_the_budget",
+        true,
+        under_aterm_a_crash_is_passed_on_once_aterm_stays_away_past_the_budget,
+    ),
+    (
+        "under_aterm_keys_typed_while_a_crash_waits_never_reach_the_shell",
+        true,
+        under_aterm_keys_typed_while_a_crash_waits_never_reach_the_shell,
+    ),
+    (
+        "under_aterm_a_crash_before_aterm_admits_the_claim_is_passed_on_at_once",
+        false,
+        under_aterm_a_crash_before_aterm_admits_the_claim_is_passed_on_at_once,
+    ),
+    (
+        "under_aterm_a_waiting_restart_is_refused_when_the_child_crashes",
+        false,
+        under_aterm_a_waiting_restart_is_refused_when_the_child_crashes,
+    ),
+    (
+        "under_aterm_a_restart_is_never_made_past_its_limit",
+        true,
+        under_aterm_a_restart_is_never_made_past_its_limit,
+    ),
+    (
+        "under_aterm_a_restart_waiting_on_a_child_that_refuses_to_start_is_passed_over",
+        true,
+        under_aterm_a_restart_waiting_on_a_child_that_refuses_to_start_is_passed_over,
+    ),
+    (
+        "under_aterm_a_move_waits_while_the_claim_is_lost_or_given_back",
+        true,
+        under_aterm_a_move_waits_while_the_claim_is_lost_or_given_back,
+    ),
+    (
+        "under_aterm_a_move_waits_until_aterm_admits_the_claim",
+        true,
+        under_aterm_a_move_waits_until_aterm_admits_the_claim,
+    ),
+    (
+        "under_aterm_a_restart_aterm_asks_for_resumes_the_session",
+        false,
+        under_aterm_a_restart_aterm_asks_for_resumes_the_session,
+    ),
+    (
+        "under_aterm_a_stall_restart_kills_a_child_deaf_to_sigterm",
+        false,
+        under_aterm_a_stall_restart_kills_a_child_deaf_to_sigterm,
+    ),
+    (
+        "under_aterm_a_restart_waits_a_bounded_time_and_is_refused",
+        true,
+        under_aterm_a_restart_waits_a_bounded_time_and_is_refused,
+    ),
+    (
+        "under_aterm_a_move_waits_for_the_upgrade_grant",
+        true,
+        under_aterm_a_move_waits_for_the_upgrade_grant,
+    ),
+    (
+        "under_aterm_a_move_waits_on_aterms_composer",
+        true,
+        under_aterm_a_move_waits_on_aterms_composer,
+    ),
+    (
+        "moves_itself_onto_a_newer_build_of_itself_at_a_safe_point",
+        true,
+        moves_itself_onto_a_newer_build_of_itself_at_a_safe_point,
+    ),
+    (
+        "under_aterm_its_own_move_waits_on_aterm_and_claims_again_under_the_same_pid",
+        true,
+        under_aterm_its_own_move_waits_on_aterm_and_claims_again_under_the_same_pid,
     ),
 ];
 
@@ -330,7 +464,8 @@ fn ignores_interrupts_meant_for_the_child() {
     // child decides what it means).
     h.kill(libc::SIGINT);
     h.kill(libc::SIGQUIT);
-    std::thread::sleep(Duration::from_millis(400));
+    // An absence: the window a signal that ended the harness would show in.
+    std::thread::sleep(signal_window());
     assert!(
         h.running(),
         "the harness outlives SIGINT and SIGQUIT sent to it"
@@ -471,7 +606,8 @@ fn holds_while_busy(
             sb.journal().contains(&format!("waits: {word}"))
         });
     }
-    std::thread::sleep(Duration::from_millis(1500));
+    // An absence: the window a move would be made in, had the hold not held.
+    std::thread::sleep(move_window());
     let events = sb.events();
     assert!(
         !events.iter().any(|e| e.starts_with("term")),
@@ -523,12 +659,12 @@ fn never_stops_a_child_with_a_draft() {
         "busy-draft",
         &["--trust-workspace"],
         |sb, h| {
-            // A person types a draft, a key at a time, and leaves it in the composer.
-            for key in [b"d", b"r", b"a"] {
-                h.type_bytes(key);
-                std::thread::sleep(Duration::from_millis(120));
+            // A person types a draft, a key at a time (each read on its own before the
+            // next is typed), and leaves it in the composer.
+            for key in ["d", "r", "a"] {
+                h.type_bytes(key.as_bytes());
+                sb.wait_event(h, "input", |e| e == format!("input {key}"));
             }
-            sb.wait_event(h, "input", |e| e == "input a");
         },
         &["draft-unproven"],
         |sb, h| {
@@ -549,7 +685,8 @@ fn never_stops_a_launch_it_cannot_resume() {
     h.wait_until(&sb, "the hold not-resumable", |sb| {
         sb.journal().contains("waits: not-resumable")
     });
-    std::thread::sleep(Duration::from_millis(1000));
+    // An absence: the window a move would be made in, had the hold not held.
+    std::thread::sleep(move_window());
     assert!(!sb.events().iter().any(|e| e.starts_with("term")));
     sb.send("exit 0");
     assert_eq!(h.wait_exit(), Exit::Code(0));
@@ -568,7 +705,8 @@ fn never_signals_again_a_child_that_outlived_its_stop() {
     h.wait_until(&sb, "STOP-UNHONOURED", |sb| {
         sb.journal().contains("STOP-UNHONOURED")
     });
-    std::thread::sleep(Duration::from_millis(1500));
+    // An absence: the window another stop would be made in, had the harness not given up.
+    std::thread::sleep(move_window());
     let events = sb.events();
     assert_eq!(
         events.iter().filter(|e| e.starts_with("term")).count(),
@@ -579,6 +717,98 @@ fn never_signals_again_a_child_that_outlived_its_stop() {
     assert!(h.running());
     sb.send("exit 0");
     assert_eq!(h.wait_exit(), Exit::Code(0));
+}
+
+/// TIME STOPPED IS NOT GRACE: a child stopped after the harness's `SIGTERM` could not act on it,
+/// so its wait starts again once it is continued. NEGATIVE CONTROL: before, the harness judged
+/// the stop unhonoured at its first tick after the continue, the time stopped counted.
+fn a_stopped_childs_stop_wait_starts_again_when_it_is_continued() {
+    let sb = Sandbox::new("stopped-stop");
+    sb.point_current(&sb.install(OLD));
+    let mut h = sb.spawn(&["--trust-workspace".into()], &[]);
+    h.wait_start(&sb, 1);
+    // The child stops itself as soon as it has ignored the SIGTERM, so the stop wait cannot
+    // run out before the stop, however slowly this test is scheduled.
+    sb.send("ignore-term stop");
+    sb.wait_event(&h, "ignore-term", |_| true);
+    sb.point_current(&sb.install(NEW));
+    assert_eq!(
+        h.wait_stopped(),
+        libc::SIGSTOP,
+        "the harness stops with its child"
+    );
+    sb.wait_event(&h, "term-ignored", |_| true);
+    sb.wait_event(&h, "stopping", |_| true);
+    stay_stopped_past_the_stop_wait();
+    h.killpg(libc::SIGCONT);
+    sb.wait_event(&h, "continued", |_| true);
+    // The positive control: the whole wait after the continue, and it is judged.
+    h.wait_until(&sb, "STOP-UNHONOURED", |sb| {
+        sb.journal().contains("STOP-UNHONOURED")
+    });
+    judged_a_whole_wait_after_the_continue(&sb);
+    assert!(h.running());
+    sb.send("exit 0");
+    assert_eq!(h.wait_exit(), Exit::Code(0));
+}
+
+/// TIME STOPPED IS NOT GRACE when only the harness is continued (`kill -CONT` on its pid, the
+/// child still stopped): the harness continues the child, and the child's wait starts again then.
+/// NEGATIVE CONTROL: before, the harness judged the stop unhonoured on the pass it was continued
+/// in, the time stopped counted, before it continued the child.
+fn a_harness_continued_alone_starts_its_childs_stop_wait_again() {
+    let sb = Sandbox::new("stopped-alone");
+    sb.point_current(&sb.install(OLD));
+    let mut h = sb.spawn(&["--trust-workspace".into()], &[]);
+    h.wait_start(&sb, 1);
+    // The child stops itself as soon as it has ignored the SIGTERM (see above).
+    sb.send("ignore-term stop");
+    sb.wait_event(&h, "ignore-term", |_| true);
+    sb.point_current(&sb.install(NEW));
+    assert_eq!(
+        h.wait_stopped(),
+        libc::SIGSTOP,
+        "the harness stops with its child"
+    );
+    sb.wait_event(&h, "term-ignored", |_| true);
+    sb.wait_event(&h, "stopping", |_| true);
+    // Then the harness alone is continued.
+    stay_stopped_past_the_stop_wait();
+    h.kill(libc::SIGCONT);
+    sb.wait_event(&h, "continued", |_| true);
+    h.wait_until(&sb, "STOP-UNHONOURED", |sb| {
+        sb.journal().contains("STOP-UNHONOURED")
+    });
+    judged_a_whole_wait_after_the_continue(&sb);
+    assert!(h.running());
+    sb.send("exit 0");
+    assert_eq!(h.wait_exit(), Exit::Code(0));
+}
+
+/// Stay stopped past the whole stop wait: the SIGTERM was sent before the stop this follows,
+/// so a stop wait and a tick from here has spent the whole wait stopped. Time that must pass,
+/// not a state to wait for; a slow machine only stops it longer.
+fn stay_stopped_past_the_stop_wait() {
+    std::thread::sleep(clock(4) + clock(0) * 2);
+}
+
+/// TIME STOPPED IS NOT GRACE, read from the journal's own times: the stop was judged unhonoured
+/// only a whole stop wait after the harness last restarted it (`CONTINUED`), never on a pass
+/// soon after the continue with the time stopped counted. The journal's wall-clock time is
+/// taken just after the monotonic restart; a second's slack absorbs a preemption between the
+/// two, while the stale judgement this guards against came within a tick of the continue.
+fn judged_a_whole_wait_after_the_continue(sb: &Sandbox) {
+    let j = sb.journal();
+    let continued = journal_ms(&j, "CONTINUED").unwrap_or_else(|| panic!("no CONTINUED: {j}"));
+    let judged = journal_ms(&j, "STOP-UNHONOURED").unwrap_or_else(|| panic!("not judged: {j}"));
+    let slack = Duration::from_secs(1);
+    let wait = u64::try_from((clock(4) - slack).as_millis()).unwrap_or(u64::MAX);
+    assert!(
+        judged >= continued + wait,
+        "the time stopped was counted: judged {} ms after the continue, before a whole {:?}: {j}",
+        judged.saturating_sub(continued),
+        clock(4)
+    );
 }
 
 fn never_moves_onto_a_build_that_does_not_start() {
@@ -592,7 +822,8 @@ fn never_moves_onto_a_build_that_does_not_start() {
     h.wait_until(&sb, "the hold build-unproved", |sb| {
         sb.journal().contains("waits: build-unproved")
     });
-    std::thread::sleep(Duration::from_millis(1500));
+    // An absence: the window a move would be made in, had the hold not held.
+    std::thread::sleep(move_window());
     assert!(
         !sb.events().iter().any(|e| e.starts_with("term")),
         "a session is never stopped for a build that does not start: {:?}",
@@ -716,7 +947,8 @@ fn keeps_the_signals_its_caller_ignored() {
     let start = h.wait_start(&sb, 1);
     assert_eq!(field(&start, "ign"), "INT,HUP", "{start}");
     h.kill(libc::SIGHUP);
-    std::thread::sleep(Duration::from_millis(400));
+    // An absence: the window a SIGHUP the harness acted on would show in.
+    std::thread::sleep(signal_window());
     assert!(h.running(), "an ignored SIGHUP does not end the session");
     assert!(!sb.events().iter().any(|e| e.starts_with("hup")));
     sb.send("exit 0");
@@ -790,7 +1022,12 @@ fn never_recurses_through_a_store_wrapper() {
     }
 }
 
-fn relaunches_a_crashed_child_within_its_budget() {
+/// A CRASH IS RELAUNCHED ON aterm's LADDER, outside aterm too (nobody else would bring the session
+/// back): a 1 s pause before the first relaunch, 10 s before the second (then 60 s, then 10
+/// minutes; a child that ran 10 minutes starts it over). A signal that ends a session reaching
+/// the harness while a relaunch waits (here `SIGTERM`) passes the crash on: the harness ends as
+/// the child did.
+fn relaunches_a_crashed_child_on_aterms_ladder() {
     let sb = Sandbox::new("crash");
     sb.point_current(&sb.install(OLD));
     let mut h = sb.spawn(
@@ -805,26 +1042,31 @@ fn relaunches_a_crashed_child_within_its_budget() {
         field(&next, "argv"),
         format!("[--trust-workspace][resume][{SESSION}]")
     );
+    assert_eq!(field(&next, "ppid"), h.pid.to_string());
     h.wait_output(&format!(
-        "Muse Code ended abnormally (exit 101); resuming session {SESSION} (relaunch 1 of 3"
+        "Muse Code ended abnormally (exit 101); resuming session {SESSION} (crash relaunch 1 after a 1000 ms pause)"
     ));
-    for n in 3..=4 {
-        sb.send(&format!("crash {}", libc::SIGKILL));
-        let next = h.wait_start(&sb, n);
-        assert_eq!(
-            field(&next, "argv"),
-            format!("[--trust-workspace][resume][{SESSION}]")
-        );
-        assert_eq!(field(&next, "ppid"), h.pid.to_string());
-    }
-    h.wait_output(&format!(
-        "Muse Code ended abnormally (SIGKILL); resuming session {SESSION} (relaunch 3 of 3"
-    ));
-    // The budget is spent: the fourth crash ends the harness as the child ended.
+    let j = sb.journal();
+    assert!(j.contains("streak=0 pause-ms=1000"), "{j}");
+    let paused = journal_ms(&j, "RELAUNCH").unwrap() - journal_ms(&j, "CRASH").unwrap();
+    assert!(
+        paused >= 1000,
+        "relaunched {paused} ms after the crash: {j}"
+    );
+    // The second crash waits 10 s; a SIGTERM meanwhile ends the session.
     sb.send(&format!("crash {}", libc::SIGKILL));
+    h.wait_until(&sb, "the second crash's pause", |sb| {
+        sb.journal().contains("streak=1 pause-ms=10000")
+    });
+    h.kill(libc::SIGTERM);
     assert_eq!(h.wait_exit(), Exit::Signal(libc::SIGKILL));
-    assert_eq!(sb.starts().len(), 4);
-    h.wait_output("not relaunching it again");
+    assert_eq!(sb.starts().len(), 2);
+    assert!(
+        sb.journal()
+            .contains("NO-RELAUNCH SIGTERM reached the harness while the crash relaunch waited"),
+        "{}",
+        sb.journal()
+    );
 }
 
 fn refuses_when_muse_is_not_installed() {
@@ -938,50 +1180,139 @@ fn no_harness_runs_muse_in_its_place() {
     }
 }
 
-/// The session id the fake aterm serves.
-const SID: &str = "s-1a";
+// ---------------------------------------------------------------------------------------
+// Under aterm: the fake aterm is alab-wire's (feature `fake`), laid for this harness.
+// ---------------------------------------------------------------------------------------
 
-/// A policy that serves contract 3 and is on, with both duties' switches on.
-const POLICY_ON: &str =
-    "OK gen=1 effective=on why=enabled contract=2,3 relaunch=true upgrade=true human_grace_s=120";
-
-/// The tab's environment under aterm: the session and the rendezvous directory's home.
-fn under_aterm_env(sb: &Sandbox) -> Vec<(&'static str, String)> {
-    vec![
-        ("TERM_PROGRAM", "aterm".to_string()),
-        ("ATERM_PARENT_SESSION_ID", SID.to_string()),
-        ("XDG_RUNTIME_DIR", sb.root.join("run").display().to_string()),
-    ]
+/// A fake aterm laid for this harness: muse-alab's roster row, the policy in effect serving
+/// contracts 2, 3 and 4, a quiet session, and no claim. A scenario changes it while the harness
+/// runs.
+fn fake_aterm(name: &str) -> FakeAterm {
+    FakeAterm::for_harness(name, &muse_alab::aterm::config())
 }
 
-/// THE FAIL-CLOSED RULE (aterm's harness design §3.2, §8.2): in an aterm tab, wherever aterm does
-/// not prove the harness's contract 3 claim, Muse Code runs in the harness's place (the same pid)
-/// and the harness says why in its journal: no control socket answers, the policy lists no
-/// contract 3, the policy is off, or the claim does not read back proven (which is let go).
+/// What aterm answers a read while it shows a dialog: it cannot say now, and asks to be asked
+/// again.
+const DIALOG_ERR: &str = "ERR aterm is showing a dialog; answer it, then retry";
+
+/// A scenario laid on a fake aterm: its name, what it changes before the launch, and a word
+/// the journal says of it.
+type Laid = (&'static str, fn(&FakeAterm), &'static str);
+
+/// A scenario aterm lifts later: its name, what it changes before the launch, what lifts it,
+/// and a word the journal says of it.
+type Lifted = (&'static str, fn(&FakeAterm), fn(&FakeAterm), &'static str);
+
+/// The fake's tab environment as [`Sandbox::spawn`] takes it.
+fn pairs(env: &[(String, String)]) -> Vec<(&str, &str)> {
+    env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+}
+
+/// Every claim the harness sent (`meta set supervisor …`), in order, without its `@<sid> `.
+fn claims(aterm: &FakeAterm) -> Vec<String> {
+    aterm
+        .verbs()
+        .into_iter()
+        .filter(|verb| verb.starts_with("meta set supervisor "))
+        .collect()
+}
+
+/// The words every contract-4 claim of the harness `pid` starts with.
+fn claim_of(pid: libc::pid_t) -> String {
+    format!(
+        "meta set supervisor muse-alab@{pid} contract=4 scope=relaunch,upgrade version={VERSION}"
+    )
+}
+
+/// How many journal lines carry `word` as their event.
+fn notes(journal: &str, word: &str) -> usize {
+    journal
+        .lines()
+        .filter(|l| l.split(' ').nth(2) == Some(word))
+        .count()
+}
+
+/// THE FAIL-CLOSED RULE (aterm's harness design §3.2, §8.2): in an aterm tab, wherever aterm
+/// refuses the harness's claim of both duties, Muse Code runs in the harness's place (the same
+/// pid) and the harness says why in its journal: no control socket answers, aterm's window
+/// cannot host a harness (`why=unhosted`), no registry row proves the holder, the claim does not
+/// read back proven under contract 3, the harness has no roster row under contract 3 (it is then
+/// never sent a claim), or aterm granted less than both duties (the claim is given back).
 fn under_aterm_passes_through_where_no_claim_is_proven() {
-    for (name, policy, prove) in [
-        ("aterm-no-socket", None, true),
+    {
+        let sb = Sandbox::new("aterm-no-socket");
+        sb.point_current(&sb.install(OLD));
+        let run = sb.root.join("run").display().to_string();
+        let env = [
+            ("TERM_PROGRAM", "aterm"),
+            ("ATERM_PARENT_SESSION_ID", "s-1a"),
+            ("XDG_RUNTIME_DIR", run.as_str()),
+        ];
+        let mut h = sb.spawn(&["--trust-workspace".into()], &env);
+        let start = h.wait_start(&sb, 1);
+        assert_eq!(
+            field(&start, "pid"),
+            h.pid.to_string(),
+            "in the harness's place"
+        );
+        let j = sb.journal();
+        assert!(j.contains(" UNCLAIMED ") && j.contains(" PASS "), "{j}");
+        sb.send("exit 3");
+        assert_eq!(h.wait_exit(), Exit::Code(3));
+    }
+    let cases: [Laid; 6] = [
         (
-            "aterm-no-contract",
-            Some("OK gen=1 effective=on why=enabled relaunch=true upgrade=true"),
-            true,
+            "aterm-unhosted",
+            |a| {
+                a.set_policy(
+                    &POLICY_ON.replace("effective=on why=enabled", "effective=off why=unhosted"),
+                )
+            },
+            "why=unhosted",
         ),
         (
-            "aterm-off",
-            Some(
-                "OK gen=1 effective=off why=autopilot-off contract=2,3 relaunch=true upgrade=true",
-            ),
-            true,
+            "aterm-unregistered",
+            |a| a.set_registered(false),
+            "unproven",
         ),
-        ("aterm-unproven", Some(POLICY_ON), false),
-    ] {
+        (
+            "aterm-unproven-3",
+            |a| {
+                a.serve_contracts(&[2, 3]);
+                a.set_proven(false);
+            },
+            "supervisor_proven=0",
+        ),
+        (
+            "aterm-unrostered-3",
+            |a| {
+                a.serve_contracts(&[2, 3]);
+                a.set_row("muse-alab", &[]);
+                a.set_row("grok-alab", &Scope::CONTRACT_3);
+            },
+            "unrostered",
+        ),
+        (
+            "aterm-narrow-4",
+            |a| a.set_known(&[Scope::Upgrade]),
+            "aterm granted scope=upgrade (the claim needs relaunch,upgrade)",
+        ),
+        (
+            "aterm-narrow-3",
+            |a| {
+                a.serve_contracts(&[2, 3]);
+                a.set_cap_after_next_claim(Some(&[Scope::Upgrade]));
+            },
+            "supervisor_scope=upgrade",
+        ),
+    ];
+    for (name, lay, says) in cases {
         let sb = Sandbox::new(name);
         sb.point_current(&sb.install(OLD));
-        let aterm =
-            policy.map(|p| fake_aterm::FakeAterm::start(&sb.root.join("run"), SID, p, prove));
-        let env = under_aterm_env(&sb);
-        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let mut h = sb.spawn(&["--trust-workspace".into()], &env);
+        let aterm = fake_aterm(name);
+        lay(&aterm);
+        let env = aterm.env();
+        let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
         let start = h.wait_start(&sb, 1);
         assert_eq!(
             field(&start, "pid"),
@@ -989,295 +1320,1072 @@ fn under_aterm_passes_through_where_no_claim_is_proven() {
             "{name}: Muse Code replaced the harness"
         );
         assert_eq!(field(&start, "argv"), "[--trust-workspace]", "{name}");
-        assert!(sb.journal().contains(" PASS "), "{name}: {}", sb.journal());
-        if let Some(aterm) = &aterm {
-            let asked = aterm.requests();
+        let j = sb.journal();
+        assert!(j.contains(" PASS ") && j.contains(says), "{name}: {j}");
+        let verbs = aterm.verbs();
+        assert!(
+            verbs.iter().any(|v| v == "harness policy"),
+            "{name}: {verbs:?}"
+        );
+        if name == "aterm-unrostered-3" {
+            assert!(verbs.iter().any(|v| v == "native-act info"), "{verbs:?}");
             assert!(
-                asked.iter().any(|r| r == &format!("@{SID} harness policy")),
-                "{name}: {asked:?}"
+                claims(&aterm).is_empty(),
+                "a claim was sent off the roster: {verbs:?}"
             );
-            let claimed = asked.iter().any(|r| r.contains("meta set supervisor"));
-            assert_eq!(claimed, name == "aterm-unproven", "{name}: {asked:?}");
-            if claimed {
-                assert!(
-                    asked.contains(&format!(
-                        "@{SID} meta unset supervisor holder=muse-alab@{}",
-                        h.pid
-                    )),
-                    "{name}: an unproven claim is let go: {asked:?}"
-                );
-            }
+        }
+        if matches!(
+            name,
+            "aterm-unproven-3" | "aterm-narrow-4" | "aterm-narrow-3"
+        ) {
+            assert!(
+                verbs.contains(&format!("meta unset supervisor holder=muse-alab@{}", h.pid)),
+                "{name}: a claim that does not stand is let go: {verbs:?}"
+            );
+            assert_eq!(aterm.holder(), None, "{name}");
         }
         sb.send("exit 3");
         assert_eq!(h.wait_exit(), Exit::Code(3), "{name}");
     }
 }
 
-/// UNDER A PROVEN CLAIM the harness supervises: it claims with its holder, contract, scope and
-/// both versions; a crash is relaunched only after one fresh read of aterm (the policy and
-/// `status`), and not at all once aterm's `[harness] relaunch` says off.
-fn under_aterm_holds_the_session_by_a_proven_claim() {
+/// AN aterm THAT IS BUSY, OFF FOR NOW OR NOT YET SERVING A CONTRACT THIS HARNESS CLAIMS AT IS
+/// NOT AWAY: it answered the handshake and then late, said `ERR` to its policy (a dialog up),
+/// has its Autopilot switched off, or serves contract 2 alone. Muse Code runs as the harness's
+/// child (never in its place, unsupervised for the session), nothing is claimed meanwhile, and
+/// the claim is made on the reclaim clock once aterm admits it, naming the child that runs.
+fn under_aterm_an_aterm_busy_or_off_for_now_keeps_the_child_supervised_and_claims_later() {
+    let cases: [Lifted; 4] = [
+        (
+            "aterm-busy",
+            |a| a.set_reply_delay(Duration::from_millis(900)),
+            |a| a.set_reply_delay(Duration::ZERO),
+            "(aterm answered the handshake)",
+        ),
+        (
+            "aterm-dialog",
+            |a| a.set_policy_reply(DIALOG_ERR),
+            FakeAterm::clear_policy_reply,
+            "policy reply=ERR:aterm",
+        ),
+        (
+            "aterm-autopilot-off",
+            |a| {
+                a.set_policy(&POLICY_ON.replace(
+                    "effective=on why=enabled",
+                    "effective=off why=autopilot-off",
+                ));
+            },
+            |a| a.set_policy(POLICY_ON),
+            "why=autopilot-off",
+        ),
+        (
+            "aterm-contract-2",
+            |a| a.serve_contracts(&[2]),
+            |a| a.serve_contracts(&[2, 3, 4]),
+            "contract=2",
+        ),
+    ];
+    for (name, lay, lift, says) in cases {
+        let sb = Sandbox::new(name);
+        sb.point_current(&sb.install(OLD));
+        let aterm = fake_aterm(name);
+        lay(&aterm);
+        let env = aterm.env();
+        let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+        let first = h.wait_start(&sb, 1);
+        assert_eq!(
+            field(&first, "ppid"),
+            h.pid.to_string(),
+            "{name}: the harness's child, not Muse Code in its place"
+        );
+        let j = sb.journal();
+        assert!(
+            j.contains(" UNCLAIMED ") && j.contains(says) && !j.contains(" PASS "),
+            "{name}: {j}"
+        );
+        if name != "aterm-busy" {
+            assert!(claims(&aterm).is_empty(), "{name}: {:?}", aterm.verbs());
+        }
+        lift(&aterm);
+        h.wait_until(&sb, "the claim made once aterm admits it", |sb| {
+            sb.journal().contains(" CLAIMED ")
+        });
+        let child = field(&first, "pid");
+        assert!(
+            claims(&aterm)
+                .iter()
+                .any(|c| c.starts_with(&claim_of(h.pid)) && c.contains(&format!(" child={child}:"))),
+            "{name}: claimed on the clock with the child that runs: {:?}",
+            claims(&aterm)
+        );
+        sb.send("exit 3");
+        assert_eq!(h.wait_exit(), Exit::Code(3), "{name}");
+    }
+}
+
+/// A CLAIM FOLLOWS aterm's POLICY: switched off (here the session's Autopilot), it is given
+/// back (`RELEASED`, `meta unset supervisor`) and nothing is relaunched or moved under it; back
+/// on, it is made again through the whole guarded sequence.
+fn under_aterm_a_claim_follows_the_policy_off_and_back_on() {
+    let sb = Sandbox::new("aterm-policy");
+    sb.point_current(&sb.install(OLD));
+    let aterm = fake_aterm("aterm-policy");
+    let env = aterm.env();
+    let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+    h.wait_start(&sb, 1);
+    h.wait_until(&sb, "the claim and its announcement", |_| {
+        claims(&aterm).len() >= 2
+    });
+    aterm.set_policy(&POLICY_ON.replace(
+        "effective=on why=enabled",
+        "effective=off why=autopilot-off",
+    ));
+    h.wait_until(&sb, "the claim given back", |sb| {
+        sb.journal().contains(" RELEASED ")
+    });
+    assert!(
+        aterm
+            .verbs()
+            .contains(&format!("meta unset supervisor holder=muse-alab@{}", h.pid)),
+        "{:?}",
+        aterm.verbs()
+    );
+    assert_eq!(aterm.holder(), None);
+    aterm.set_policy(POLICY_ON);
+    h.wait_until(&sb, "the claim made again", |sb| {
+        notes(&sb.journal(), "CLAIMED") >= 2
+    });
+    assert_eq!(aterm.holder(), Some(format!("muse-alab@{}", h.pid)));
+    sb.send("exit 3");
+    assert_eq!(h.wait_exit(), Exit::Code(3));
+}
+
+/// UNDER A CLAIM the harness supervises: it claims with its holder, contract, scope, version and
+/// vendor build, then announces the claim again with each child it starts (`child=<pid>:<start>`);
+/// a crash is relaunched on aterm's ladder (a 1 s pause first) only after one fresh read of aterm
+/// (the policy and `status`). A second crash waits the ladder's 10 s: a restart aterm asks for
+/// meanwhile is refused (no child runs), and a `SIGINT` to the harness passes the crash on, the
+/// harness ending as the child did.
+fn under_aterm_holds_the_session_by_a_claim_and_relaunches_on_the_ladder() {
     let sb = Sandbox::new("aterm-claimed");
     sb.point_current(&sb.install(OLD));
-    let aterm = fake_aterm::FakeAterm::start(&sb.root.join("run"), SID, POLICY_ON, true);
-    let env = under_aterm_env(&sb);
-    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let mut h = sb.spawn(&["--trust-workspace".into()], &env);
+    let aterm = fake_aterm("aterm-claimed");
+    let env = aterm.env();
+    let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
     let first = h.wait_start(&sb, 1);
     assert_eq!(
         field(&first, "ppid"),
         h.pid.to_string(),
         "the harness's child"
     );
-    let claim = format!(
-        "@{SID} meta set supervisor muse-alab@{} contract=3 scope=relaunch,upgrade version={VERSION} vendor={OLD}",
-        h.pid
-    );
-    let asked = aterm.requests();
-    assert!(asked.contains(&claim), "{asked:?}");
-    assert!(sb.journal().contains(" CLAIMED "), "{}", sb.journal());
-    let before = asked.len();
-    sb.send(&format!("crash {}", libc::SIGKILL));
-    let second = h.wait_start(&sb, 2);
-    assert_eq!(field(&second, "ppid"), h.pid.to_string());
-    let fresh: Vec<String> = aterm.requests().split_off(before);
-    let policy_at = fresh
-        .iter()
-        .position(|r| r == &format!("@{SID} harness policy"));
-    let status_at = fresh.iter().position(|r| r == &format!("@{SID} status"));
-    assert!(
-        policy_at.is_some() && status_at.is_some(),
-        "the relaunch waited on a fresh read of aterm: {fresh:?}"
-    );
-    aterm.set_policy("OK gen=2 effective=on why=enabled contract=2,3 relaunch=false upgrade=true");
-    sb.send(&format!("crash {}", libc::SIGKILL));
-    assert_eq!(h.wait_exit(), Exit::Signal(libc::SIGKILL));
+    h.wait_until(&sb, "the claim and its announcement", |_| {
+        claims(&aterm).len() >= 2
+    });
+    let sent = claims(&aterm);
     assert_eq!(
-        sb.starts().len(),
-        2,
-        "no relaunch once aterm says relaunch is off"
+        sent[0],
+        format!("{} vendor={OLD}", claim_of(h.pid)),
+        "{sent:?}"
+    );
+    assert!(
+        sent[1].starts_with(&format!(
+            "{} vendor={OLD} child={}:",
+            claim_of(h.pid),
+            field(&first, "pid")
+        )),
+        "{sent:?}"
     );
     let j = sb.journal();
     assert!(
-        j.contains("NO-RELAUNCH") && j.contains("relaunch is off"),
+        j.contains(" CLAIMED ") && j.contains(" REANNOUNCED "),
+        "{j}"
+    );
+    let before = aterm.verbs().len();
+    sb.send(&format!("crash {}", libc::SIGKILL));
+    let second = h.wait_start(&sb, 2);
+    assert_eq!(field(&second, "ppid"), h.pid.to_string());
+    assert_eq!(
+        field(&second, "argv"),
+        format!("[--trust-workspace][resume][{SESSION}]")
+    );
+    let fresh: Vec<String> = aterm.verbs().split_off(before);
+    assert!(
+        fresh.iter().any(|v| v == "harness policy") && fresh.iter().any(|v| v == "status"),
+        "the relaunch waited on a fresh read of aterm: {fresh:?}"
+    );
+    let j = sb.journal();
+    assert!(j.contains("streak=0 pause-ms=1000"), "{j}");
+    let paused = journal_ms(&j, "RELAUNCH").unwrap() - journal_ms(&j, "CRASH").unwrap();
+    assert!(
+        paused >= 1000,
+        "relaunched {paused} ms after the crash: {j}"
+    );
+    let pid2 = field(&second, "pid");
+    h.wait_until(&sb, "the new child announced", |_| {
+        aterm
+            .child()
+            .is_some_and(|c| c.starts_with(&format!("{pid2}:")))
+    });
+    // The second crash waits 10 s.
+    sb.send(&format!("crash {}", libc::SIGKILL));
+    h.wait_until(&sb, "the second crash", |sb| {
+        sb.journal().contains("streak=1 pause-ms=10000")
+    });
+    aterm.send_restart("asked");
+    h.wait_until(&sb, "the restart refused while no child runs", |sb| {
+        sb.journal()
+            .contains("RESTART-REFUSED cause=asked crash-pending")
+    });
+    h.kill(libc::SIGINT);
+    assert_eq!(h.wait_exit(), Exit::Signal(libc::SIGKILL));
+    assert_eq!(sb.starts().len(), 2, "the crash was passed on");
+    let j = sb.journal();
+    assert!(
+        j.contains(
+            "NO-RELAUNCH SIGINT or SIGQUIT reached the harness while the crash relaunch waited"
+        ),
         "{j}"
     );
 }
 
-/// A CRASH WHILE THE CLAIM LAPSED is still relaunched: in a tab the harness leads no built-in
-/// lane of aterm's can bring the child back, so a claim aterm no longer shows is made again and
-/// the relaunch judged on a fresh read under it, at once when aterm proves it at once, else held
-/// (`HOLD`) until aterm proves it again.
-fn under_aterm_a_crash_while_the_claim_lapsed_waits_for_it_and_is_relaunched() {
-    let sb = Sandbox::new("aterm-lapsed");
+/// A CRASH aterm's `[harness] relaunch = false` covers is passed on: the harness ends as the child
+/// did, nothing relaunched.
+fn under_aterm_a_crash_is_passed_on_when_aterm_says_relaunch_is_off() {
+    let sb = Sandbox::new("aterm-relaunch-off");
     sb.point_current(&sb.install(OLD));
-    let aterm = fake_aterm::FakeAterm::start(&sb.root.join("run"), SID, POLICY_ON, true);
-    let env = under_aterm_env(&sb);
-    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let mut h = sb.spawn(&["--trust-workspace".into()], &env);
-    let _first = h.wait_start(&sb, 1);
-    let made_again = |sb: &Sandbox| sb.journal().matches("holds the session again").count();
-    assert_eq!(made_again(&sb), 0, "{}", sb.journal());
-    // aterm no longer shows the claim, and proves it again when asked.
-    aterm.forget_claim();
-    sb.send(&format!("crash {}", libc::SIGKILL));
-    let second = h.wait_start(&sb, 2);
-    assert_eq!(field(&second, "ppid"), h.pid.to_string());
-    assert_eq!(made_again(&sb), 1, "{}", sb.journal());
-    assert!(
-        !sb.journal().contains(" HOLD "),
-        "proven again at once, the relaunch held for nothing: {}",
-        sb.journal()
-    );
-    // aterm no longer shows it, and refuses to prove it until later.
-    aterm.set_prove(false);
-    aterm.forget_claim();
-    sb.send(&format!("crash {}", libc::SIGKILL));
-    h.wait_until(&sb, "the relaunch's hold", |sb| {
-        sb.journal().contains(" HOLD ")
+    let aterm = fake_aterm("aterm-relaunch-off");
+    aterm.set_policy(&POLICY_ON.replace("relaunch=true", "relaunch=false"));
+    let env = aterm.env();
+    let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+    h.wait_start(&sb, 1);
+    h.wait_until(&sb, "the claim and its announcement", |_| {
+        claims(&aterm).len() >= 2
     });
+    sb.send(&format!("crash {}", libc::SIGKILL));
+    assert_eq!(h.wait_exit(), Exit::Signal(libc::SIGKILL));
+    assert_eq!(sb.starts().len(), 1);
+    let j = sb.journal();
+    assert!(
+        j.contains("NO-RELAUNCH aterm's word: relaunch=false"),
+        "{j}"
+    );
+}
+
+/// A CRASH WHILE aterm IS AWAY is still relaunched: in a tab the harness leads no built-in lane of
+/// aterm's can bring the child back, so the crash waits (`CRASH-WAIT`) while the claim is made
+/// again on the reclaim clock (here refused once: no registry row proves it), and is relaunched
+/// once aterm proves it again. The wait sleeps between its asks: past the ladder's pause it costs
+/// the harness under a tenth of the time in CPU (NEGATIVE CONTROL: a wait capped at the pause's
+/// end spun on a zero timeout, a whole core on an idle machine). A line typed at the dead screen
+/// meanwhile never reaches the resumed Muse Code: the relaunched child reads only what is typed
+/// after it starts.
+fn under_aterm_a_crash_while_aterm_is_away_waits_for_the_claim_and_is_relaunched() {
+    let sb = Sandbox::new("aterm-away");
+    sb.point_current(&sb.install(OLD));
+    let aterm = fake_aterm("aterm-away");
+    let env = aterm.env();
+    let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+    h.wait_start(&sb, 1);
+    h.wait_until(&sb, "the claim and its announcement", |_| {
+        claims(&aterm).len() >= 2
+    });
+    aterm.set_registered(false);
+    aterm.restart();
+    h.wait_until(&sb, "the link lost", |sb| sb.journal().contains(" LOST "));
+    sb.send(&format!("crash {}", libc::SIGKILL));
+    h.wait_until(&sb, "the crash waiting for aterm", |sb| {
+        sb.journal().contains(" CRASH-WAIT ")
+    });
+    h.type_bytes(b"retry\r");
+    h.wait_until(&sb, "a refused reclaim", |sb| {
+        sb.journal().contains(" UNCLAIMED ")
+    });
+    // Past the 1 s pause (the reclaim is 5 s after the loss), aterm still away.
+    let window = Duration::from_secs(2);
+    let (cpu, wall) = (cpu_time(h.pid), Instant::now());
+    std::thread::sleep(window);
+    let (cpu, wall) = (cpu_time(h.pid) - cpu, wall.elapsed());
     assert_eq!(
         sb.starts().len(),
-        2,
+        1,
         "no relaunch before aterm proves the claim"
     );
-    aterm.set_prove(true);
-    let third = h.wait_start(&sb, 3);
-    assert_eq!(field(&third, "ppid"), h.pid.to_string());
-    assert_eq!(made_again(&sb), 2, "{}", sb.journal());
+    assert!(
+        cpu < wall / 10,
+        "the crash wait used {cpu:?} of CPU in {wall:?} while aterm was away"
+    );
+    aterm.set_registered(true);
+    let second = h.wait_start(&sb, 2);
+    assert_eq!(field(&second, "ppid"), h.pid.to_string());
     let j = sb.journal();
+    assert_eq!(notes(&j, "CLAIMED"), 2, "{j}");
     assert!(!j.contains("NO-RELAUNCH"), "{j}");
+    // What the relaunched child reads first is what was typed after it started.
+    h.type_bytes(b"after\r");
+    sb.wait_event(&h, "submit", |e| e == "submit after");
+    assert!(
+        !sb.events().iter().any(|e| e.contains("retry")),
+        "a line typed while the crash waited reached the resumed child: {:?}",
+        sb.events()
+    );
     sb.send("exit 0");
     assert_eq!(h.wait_exit(), Exit::Code(0));
 }
 
-/// A CRASH IS PASSED BACK once the claim stays away past the hold: the harness waits the hold
-/// (`HOLD`), then ends as the child ended, with nothing relaunched (`NO-RELAUNCH`).
-fn under_aterm_a_crash_is_passed_back_once_the_claim_stays_away_past_the_hold() {
-    let sb = Sandbox::new("aterm-lapsed-past");
+/// KEYS TYPED WHILE A CRASH WAITS NEVER REACH THE SHELL: the harness runs as a shell's command,
+/// the crash waits for an aterm that stays away past the away budget (1.5 s here), a person types
+/// a line at the dead screen meanwhile, and the crash is passed on. The shell's next read gets
+/// only what is typed after the harness ended (NEGATIVE CONTROL: before, the shell read the line
+/// typed during the wait, and an interactive one would have run it as a command).
+fn under_aterm_keys_typed_while_a_crash_waits_never_reach_the_shell() {
+    let sb = Sandbox::new("aterm-away-keys");
     sb.point_current(&sb.install(OLD));
-    let aterm = fake_aterm::FakeAterm::start(&sb.root.join("run"), SID, POLICY_ON, true);
-    let mut env = under_aterm_env(&sb);
-    env.push(("MUSE_ALAB_TEST_TIMING", format!("{TIMING},1500")));
-    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let mut h = sb.spawn(&["--trust-workspace".into()], &env);
-    let _first = h.wait_start(&sb, 1);
-    aterm.set_prove(false);
-    aterm.forget_claim();
+    let aterm = fake_aterm("aterm-away-keys");
+    let mut env = aterm.env();
+    env.push(("MUSE_ALAB_TEST_TIMING".into(), format!("{TIMING},1500")));
+    let mut h = sb.spawn_under_shell(
+        r#""$0" --trust-workspace; st=$?; IFS= read -r line; printf 'harness ended %s; shell read [%s]\n' "$st" "$line""#,
+        &pairs(&env),
+    );
+    let first = h.wait_start(&sb, 1);
+    let harness: libc::pid_t = field(&first, "ppid").parse().expect("the harness's pid");
+    assert_ne!(harness, h.pid, "the harness is the shell's command");
+    h.wait_until(&sb, "the claim and its announcement", |_| {
+        claims(&aterm).len() >= 2
+    });
+    aterm.set_registered(false);
+    aterm.restart();
+    h.wait_until(&sb, "the link lost", |sb| sb.journal().contains(" LOST "));
+    sb.send(&format!("crash {}", libc::SIGKILL));
+    h.wait_until(&sb, "the crash", |sb| sb.journal().contains(" CRASH "));
+    h.type_bytes(b"retry\r");
+    h.wait_until(&sb, "the crash passed on", |sb| {
+        sb.journal().contains("NO-RELAUNCH claim-not-proven-again")
+    });
+    // SAFETY: a null signal to a pid this test saw start; it only asks whether it exists.
+    h.wait_until(&sb, "the harness ended", |_| unsafe {
+        libc::kill(harness, 0) != 0
+    });
+    // An absence: the window the shell would read a line still queued for it in.
+    std::thread::sleep(signal_window());
+    assert!(
+        !h.output().contains("shell read ["),
+        "the shell read a line typed while the crash waited: {}",
+        h.output()
+    );
+    h.type_bytes(b"after\r");
+    h.wait_output("shell read [");
+    let out = h.output();
+    assert!(
+        out.contains(&format!(
+            "harness ended {}; shell read [after]",
+            128 + libc::SIGKILL
+        )),
+        "{out}"
+    );
+    assert_eq!(h.wait_exit(), Exit::Code(0));
+    assert_eq!(sb.starts().len(), 1, "nothing relaunched");
+}
+
+/// A CRASH BEFORE aterm ADMITS THE CLAIM is passed on at once (`NO-RELAUNCH no-claim`): with
+/// Autopilot off at the launch the harness supervises Muse Code and claims every 5 s, but aterm
+/// never let it lead the tab, so it does not wait out aterm's 45 s away grace for a claim nobody
+/// lost (NEGATIVE CONTROL: before, the crash waited, `CRASH-WAIT … link-lost`, the full 45 s).
+fn under_aterm_a_crash_before_aterm_admits_the_claim_is_passed_on_at_once() {
+    let sb = Sandbox::new("aterm-unadmitted-crash");
+    sb.point_current(&sb.install(OLD));
+    let aterm = fake_aterm("aterm-unadmitted-crash");
+    aterm.set_policy(&POLICY_ON.replace(
+        "effective=on why=enabled",
+        "effective=off why=autopilot-off",
+    ));
+    let env = aterm.env();
+    let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+    let first = h.wait_start(&sb, 1);
+    assert_eq!(field(&first, "ppid"), h.pid.to_string(), "supervised");
+    h.wait_until(&sb, "the claim not made", |sb| {
+        sb.journal().contains(" UNCLAIMED ")
+    });
     sb.send(&format!("crash {}", libc::SIGKILL));
     assert_eq!(h.wait_exit(), Exit::Signal(libc::SIGKILL));
     assert_eq!(sb.starts().len(), 1, "nothing relaunched");
     let j = sb.journal();
     assert!(
-        j.contains(" HOLD ") && j.contains("NO-RELAUNCH") && j.contains("again within 1 s"),
+        j.contains("NO-RELAUNCH no-claim: aterm has not admitted this harness's claim"),
+        "{j}"
+    );
+    assert!(!j.contains(" CRASH-WAIT "), "{j}");
+    assert!(claims(&aterm).is_empty(), "{:?}", aterm.verbs());
+}
+
+/// A CRASH IS PASSED ON once aterm stays away past the away budget (shortened to 1.5 s here, 45 s
+/// in production): the harness waits it (`CRASH-WAIT`), then ends as the child ended, with
+/// nothing relaunched (`NO-RELAUNCH claim-not-proven-again`).
+fn under_aterm_a_crash_is_passed_on_once_aterm_stays_away_past_the_budget() {
+    let sb = Sandbox::new("aterm-away-past");
+    sb.point_current(&sb.install(OLD));
+    let aterm = fake_aterm("aterm-away-past");
+    let mut env = aterm.env();
+    env.push(("MUSE_ALAB_TEST_TIMING".into(), format!("{TIMING},1500")));
+    let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+    h.wait_start(&sb, 1);
+    h.wait_until(&sb, "the claim and its announcement", |_| {
+        claims(&aterm).len() >= 2
+    });
+    aterm.set_registered(false);
+    aterm.restart();
+    h.wait_until(&sb, "the link lost", |sb| sb.journal().contains(" LOST "));
+    sb.send(&format!("crash {}", libc::SIGKILL));
+    assert_eq!(h.wait_exit(), Exit::Signal(libc::SIGKILL));
+    assert_eq!(sb.starts().len(), 1, "nothing relaunched");
+    let j = sb.journal();
+    assert!(
+        j.contains(" CRASH-WAIT ") && j.contains("NO-RELAUNCH claim-not-proven-again"),
         "{j}"
     );
 }
 
-// ---------------------------------------------------------------------------------------
-// The fake aterm: one session's control socket, its graph entry and its token.
-// ---------------------------------------------------------------------------------------
+/// A RESTART aterm ASKS FOR (`restart cause=asked`, a person's `aterm ctl restart`) ends the child
+/// with `SIGTERM` and resumes the same session at once, no safe point waited for and no crash
+/// counted; it is made whatever `[harness] relaunch` says, which limits crashes only. One that
+/// names a model (`cause=model model=<word>`) starts Muse Code on it (`--model=<word>` before
+/// `resume`), and one onto another account is refused, the child running on: Muse Code takes no
+/// account home this harness can set. Each new child is announced.
+fn under_aterm_a_restart_aterm_asks_for_resumes_the_session() {
+    let sb = Sandbox::new("aterm-restart");
+    sb.point_current(&sb.install(OLD));
+    let aterm = fake_aterm("aterm-restart");
+    aterm.set_policy(&POLICY_ON.replace("relaunch=true", "relaunch=false"));
+    let env = aterm.env();
+    let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+    h.wait_start(&sb, 1);
+    h.wait_until(&sb, "the claim and its announcement", |_| {
+        claims(&aterm).len() >= 2
+    });
+    aterm.send_restart("asked");
+    let second = h.wait_start(&sb, 2);
+    assert_eq!(field(&second, "ppid"), h.pid.to_string());
+    assert_eq!(
+        field(&second, "argv"),
+        format!("[--trust-workspace][resume][{SESSION}]")
+    );
+    assert!(sb.events().iter().any(|e| e == "term"), "{:?}", sb.events());
+    let j = sb.journal();
+    assert!(j.contains(" RESTART cause=asked: child="), "{j}");
+    assert!(!j.contains(" CRASH "), "a restart is no crash: {j}");
+    let pid2 = field(&second, "pid");
+    h.wait_until(&sb, "the new child announced", |_| {
+        aterm
+            .child()
+            .is_some_and(|c| c.starts_with(&format!("{pid2}:")))
+    });
+    // An account move is refused; the child runs on.
+    aterm.send_account_restart("account", "work", None);
+    h.wait_until(&sb, "the account move refused", |sb| {
+        sb.journal()
+            .contains("RESTART-REFUSED cause=account to=work")
+    });
+    // A model move starts Muse Code on aterm's model.
+    aterm.send_model_restart("model", "lab-m2");
+    let third = h.wait_start(&sb, 3);
+    assert_eq!(
+        field(&third, "argv"),
+        format!("[--trust-workspace][--model=lab-m2][resume][{SESSION}]")
+    );
+    assert!(
+        sb.journal()
+            .contains(" RESTART cause=model model=lab-m2: child=")
+    );
+    assert_eq!(sb.starts().len(), 3, "the account move started nothing");
+    sb.send("exit 0");
+    assert_eq!(h.wait_exit(), Exit::Code(0));
+}
 
-mod fake_aterm {
-    use std::io::{BufRead as _, BufReader, Write as _};
-    use std::os::unix::net::{UnixListener, UnixStream};
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+/// A RESTART FOR A STALL is made whatever the child does with its `SIGTERM`: a child that ignores
+/// it gets `SIGKILL` after the stall's grace (the stop wait here, at most aterm's 5 s), and the
+/// session is resumed as for any restart. Another restart aterm sends while that child is being
+/// ended is passed over (`RESTART-PASSED-OVER … already being ended`): it was meant for the
+/// child that is going, and the child resumed after it is never restarted for it.
+fn under_aterm_a_stall_restart_kills_a_child_deaf_to_sigterm() {
+    let sb = Sandbox::new("aterm-stall");
+    sb.point_current(&sb.install(OLD));
+    let aterm = fake_aterm("aterm-stall");
+    let env = aterm.env();
+    let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+    h.wait_start(&sb, 1);
+    h.wait_until(&sb, "the claim and its announcement", |_| {
+        claims(&aterm).len() >= 2
+    });
+    sb.send("ignore-term");
+    sb.wait_event(&h, "ignore-term", |_| true);
+    aterm.send_restart("stall");
+    sb.wait_event(&h, "term-ignored", |_| true);
+    aterm.send_restart("asked");
+    h.wait_until(&sb, "the second restart passed over", |sb| {
+        sb.journal()
+            .contains("RESTART-PASSED-OVER cause=asked the child is already being ended")
+    });
+    let second = h.wait_start(&sb, 2);
+    assert_eq!(
+        field(&second, "argv"),
+        format!("[--trust-workspace][resume][{SESSION}]")
+    );
+    let j = sb.journal();
+    assert!(j.contains(" RESTART-KILL cause=stall "), "{j}");
+    let killed = journal_ms(&j, "RESTART-KILL").unwrap() - journal_ms(&j, "RESTART").unwrap();
+    assert!(
+        killed >= clock(4).as_millis() as u64,
+        "SIGKILL {killed} ms after SIGTERM: {j}"
+    );
+    // An absence: the window the passed-over restart would have ended the resumed child in.
+    std::thread::sleep(signal_window());
+    assert_eq!(sb.starts().len(), 2, "{:?}", sb.events());
+    assert_eq!(notes(&sb.journal(), "RESTART"), 1, "{}", sb.journal());
+    sb.send("exit 0");
+    assert_eq!(h.wait_exit(), Exit::Code(0));
+}
 
-    const TOKEN: &str = "fake-token";
+/// A RESTART WAITING WHEN ITS CHILD CRASHES is refused (`RESTART-REFUSED … child-ended`): aterm
+/// asked it for that child (here while aterm said `ERR` to its policy, a dialog up, so it waited),
+/// and the child the crash relaunch resumes once aterm answers again is never restarted for it.
+fn under_aterm_a_waiting_restart_is_refused_when_the_child_crashes() {
+    let sb = Sandbox::new("aterm-restart-crash");
+    sb.point_current(&sb.install(OLD));
+    let aterm = fake_aterm("aterm-restart-crash");
+    let env = aterm.env();
+    let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+    h.wait_start(&sb, 1);
+    h.wait_until(&sb, "the claim and its announcement", |_| {
+        claims(&aterm).len() >= 2
+    });
+    aterm.set_policy_reply(DIALOG_ERR);
+    aterm.send_restart("asked");
+    h.wait_until(&sb, "the restart waiting for aterm", |sb| {
+        sb.journal()
+            .contains("RESTART-WAITS cause=asked aterm did not answer")
+    });
+    sb.send(&format!("crash {}", libc::SIGKILL));
+    h.wait_until(&sb, "the restart refused with its child", |sb| {
+        sb.journal()
+            .contains("RESTART-REFUSED cause=asked child-ended")
+    });
+    h.wait_until(&sb, "the crash waiting for aterm", |sb| {
+        sb.journal().contains(" CRASH-WAIT ")
+    });
+    aterm.clear_policy_reply();
+    let second = h.wait_start(&sb, 2);
+    assert_eq!(
+        field(&second, "argv"),
+        format!("[--trust-workspace][resume][{SESSION}]")
+    );
+    // An absence: the window a restart still waiting would be made in (asked again each second).
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(sb.starts().len(), 2, "{:?}", sb.events());
+    let j = sb.journal();
+    assert_eq!(notes(&j, "RESTART"), 0, "{j}");
+    sb.send("exit 0");
+    assert_eq!(h.wait_exit(), Exit::Code(0));
+}
 
-    /// What the fake keeps: the policy it answers, whether it proves a claim, the claim it
-    /// holds, and every request it was asked (after `AUTH`).
-    #[derive(Default)]
-    struct State {
-        policy: String,
-        prove: bool,
-        holder: Option<String>,
-        requests: Vec<String>,
-    }
+/// A RESTART IS NEVER MADE PAST ITS LIMIT: one waiting for aterm (a dialog up) when the harness is
+/// stopped, and continued only after its limit (3 s here, 45 s in production) has passed, is
+/// refused on the first pass after the continue, though aterm answers again by then; the child is
+/// never signalled (NEGATIVE CONTROL: before, that pass asked aterm first, and a permitted
+/// restart ended the child for a request long gone).
+fn under_aterm_a_restart_is_never_made_past_its_limit() {
+    let sb = Sandbox::new("aterm-restart-late");
+    sb.point_current(&sb.install(OLD));
+    let aterm = fake_aterm("aterm-restart-late");
+    let mut env = aterm.env();
+    env.push(("MUSE_ALAB_TEST_TIMING".into(), format!("{TIMING},3000")));
+    let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+    h.wait_start(&sb, 1);
+    h.wait_until(&sb, "the claim and its announcement", |_| {
+        claims(&aterm).len() >= 2
+    });
+    aterm.set_policy_reply(DIALOG_ERR);
+    aterm.send_restart("asked");
+    h.wait_until(&sb, "the restart waiting for aterm", |sb| {
+        sb.journal()
+            .contains("RESTART-WAITS cause=asked aterm did not answer")
+    });
+    h.kill(libc::SIGSTOP);
+    assert_eq!(h.wait_stopped(), libc::SIGSTOP);
+    // Time that must pass: the restart's whole limit, and a little more, stopped.
+    std::thread::sleep(Duration::from_millis(3500));
+    aterm.clear_policy_reply();
+    h.kill(libc::SIGCONT);
+    h.wait_until(&sb, "the restart refused past its limit", |sb| {
+        sb.journal()
+            .contains("RESTART-REFUSED cause=asked not made within 3000 ms")
+    });
+    // An absence: the window a restart made on that pass would have ended the child in.
+    std::thread::sleep(signal_window());
+    assert!(
+        !sb.events().iter().any(|e| e.starts_with("term")),
+        "{:?}",
+        sb.events()
+    );
+    assert_eq!(sb.starts().len(), 1);
+    assert_eq!(notes(&sb.journal(), "RESTART"), 0, "{}", sb.journal());
+    assert!(h.running());
+    sb.send("exit 0");
+    assert_eq!(h.wait_exit(), Exit::Code(0));
+}
 
-    /// A fake aterm control socket for one session.
-    pub struct FakeAterm {
-        sock: PathBuf,
-        state: Arc<Mutex<State>>,
-    }
+/// A RESTART WAITING ON A CHILD THAT REFUSES TO START is passed over at the next child's start
+/// (`RESTART-PASSED-OVER … it waited for the child before this one`): a move starts a new build,
+/// aterm asks a restart while that build has no session yet (so it waits), the build refuses to
+/// start and the harness falls back onto the build it ran; that child is never restarted for a
+/// request aterm made of the one before it.
+fn under_aterm_a_restart_waiting_on_a_child_that_refuses_to_start_is_passed_over() {
+    let sb = Sandbox::new("aterm-restart-fallback");
+    let old = sb.install(OLD);
+    sb.point_current(&old);
+    let aterm = fake_aterm("aterm-restart-fallback");
+    let env = aterm.env();
+    let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+    h.wait_start(&sb, 1);
+    h.wait_until(&sb, "the claim and its announcement", |_| {
+        claims(&aterm).len() >= 2
+    });
+    // Answers its probe, then refuses to start once the test says so.
+    let go = sb.root.join("ctl").join("go");
+    let refusing = sb.install_script(
+        NEW,
+        &format!(
+            "if [ \"$1\" = --help ]; then exit 0; fi\nwhile [ ! -e '{}' ]; do sleep 0.05; done\nexit 1",
+            go.display()
+        ),
+    );
+    sb.point_current(&refusing);
+    h.wait_until(&sb, "the move onto the new build announced", |sb| {
+        sb.journal().contains(" RELAUNCH moving ") && notes(&sb.journal(), "REANNOUNCED") >= 2
+    });
+    aterm.send_restart("asked");
+    h.wait_until(
+        &sb,
+        "the restart waiting for the new child's session",
+        |sb| {
+            sb.journal()
+                .contains("RESTART-WAITS cause=asked no session lock")
+        },
+    );
+    fs::write(&go, b"").expect("go");
+    let second = h.wait_start(&sb, 2);
+    assert_eq!(
+        field(&second, "exe"),
+        old.join("bin").join("muse").display().to_string(),
+        "fell back onto the build it ran"
+    );
+    let j = sb.journal();
+    assert!(
+        j.contains("RESTART-PASSED-OVER cause=asked it waited for the child before this one"),
+        "{j}"
+    );
+    // An absence: the window a restart still waiting would be made in (asked again each second).
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(sb.starts().len(), 2, "{:?}", sb.events());
+    assert_eq!(notes(&sb.journal(), "RESTART"), 0, "{}", sb.journal());
+    sb.send("exit 0");
+    assert_eq!(h.wait_exit(), Exit::Code(0));
+}
 
-    impl FakeAterm {
-        /// Serve session `sid` under `runtime` (`<runtime>/aterm/graph/<sid>` names the socket),
-        /// answering `harness policy` with `policy` and proving a claim when `prove`.
-        pub fn start(runtime: &Path, sid: &str, policy: &str, prove: bool) -> FakeAterm {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            // A socket path must fit `sun_path`: a short name in the temporary directory.
-            let sock = std::env::temp_dir().join(format!(
-                "ma-{}-{}.sock",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::SeqCst)
-            ));
-            let _ = std::fs::remove_file(&sock);
-            std::fs::write(sock.with_extension("sock.token"), format!("{TOKEN}\n")).expect("token");
-            let graph = runtime.join("aterm").join("graph");
-            std::fs::create_dir_all(&graph).expect("graph dir");
-            std::fs::write(graph.join(sid), format!("pid 1\nsock {}\n", sock.display()))
-                .expect("graph entry");
-            let listener = UnixListener::bind(&sock).expect("bind the fake aterm");
-            let state = Arc::new(Mutex::new(State {
-                policy: policy.to_string(),
-                prove,
-                ..State::default()
-            }));
-            let served = Arc::clone(&state);
-            std::thread::spawn(move || {
-                for stream in listener.incoming().flatten() {
-                    let state = Arc::clone(&served);
-                    std::thread::spawn(move || serve(stream, &state));
-                }
+/// A RESTART THAT CANNOT BE MADE YET waits, bounded: with no session lock naming the child it
+/// waits (`RESTART-WAITS`) and is refused once the away budget (1.5 s here, 45 s in production)
+/// has passed since it arrived; the child runs on, never signalled.
+fn under_aterm_a_restart_waits_a_bounded_time_and_is_refused() {
+    let sb = Sandbox::new("aterm-restart-waits");
+    sb.point_current(&sb.install(OLD));
+    let aterm = fake_aterm("aterm-restart-waits");
+    let mut env = aterm.env();
+    env.push(("MUSE_ALAB_TEST_TIMING".into(), format!("{TIMING},1500")));
+    env.push(("FAKE_MUSE_NO_SESSION".into(), "1".into()));
+    let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+    h.wait_start(&sb, 1);
+    h.wait_until(&sb, "the claim and its announcement", |_| {
+        claims(&aterm).len() >= 2
+    });
+    aterm.send_restart("asked");
+    h.wait_until(&sb, "the restart refused", |sb| {
+        sb.journal()
+            .contains("RESTART-REFUSED cause=asked not made within 1500 ms")
+    });
+    let j = sb.journal();
+    assert!(
+        j.contains("RESTART-WAITS cause=asked no session lock"),
+        "{j}"
+    );
+    assert!(!sb.events().iter().any(|e| e.starts_with("term")));
+    assert_eq!(sb.starts().len(), 1);
+    sb.send("exit 0");
+    assert_eq!(h.wait_exit(), Exit::Code(0));
+}
+
+/// A MOVE IS aterm's `upgrade` DUTY: once a person's cap narrows the claim to `relaunch`, the
+/// harness holds every move (`upgrade-not-granted`) however quiet the session, and moves again
+/// once aterm grants `upgrade` back.
+fn under_aterm_a_move_waits_for_the_upgrade_grant() {
+    let sb = Sandbox::new("aterm-cap");
+    sb.point_current(&sb.install(OLD));
+    let aterm = fake_aterm("aterm-cap");
+    let env = aterm.env();
+    let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+    h.wait_start(&sb, 1);
+    h.wait_until(&sb, "the claim and its announcement", |_| {
+        claims(&aterm).len() >= 2
+    });
+    aterm.set_cap(Some(&[Scope::Relaunch]));
+    h.wait_until(&sb, "the narrowed grant", |sb| {
+        sb.journal().contains(" NARROWED scope=relaunch ")
+    });
+    sb.point_current(&sb.install(NEW));
+    h.wait_until(&sb, "the move held", |sb| {
+        sb.journal().contains("waits: upgrade-not-granted (")
+    });
+    // An absence: the window a move would be made in, had the grant not held it.
+    std::thread::sleep(move_window());
+    assert!(
+        !sb.events().iter().any(|e| e.starts_with("term")),
+        "{:?}",
+        sb.events()
+    );
+    assert_eq!(sb.starts().len(), 1);
+    aterm.set_cap_restores(true);
+    aterm.set_cap(None);
+    let second = h.wait_start(&sb, 2);
+    assert_eq!(
+        field(&second, "argv"),
+        format!("[--trust-workspace][resume][{SESSION}]")
+    );
+    assert!(
+        field(&second, "exe").contains(
+            &muse_alab::version::Version::parse(NEW)
+                .unwrap()
+                .build_id()
+                .to_string()
+        )
+    );
+    sb.send("exit 0");
+    assert_eq!(h.wait_exit(), Exit::Code(0));
+}
+
+/// The policy with the session's Autopilot switched off.
+fn policy_off() -> String {
+    POLICY_ON.replace(
+        "effective=on why=enabled",
+        "effective=off why=autopilot-off",
+    )
+}
+
+/// A newer build installed while no claim stands, `word` holding the move however quiet the
+/// session: the hold is journalled, and nothing is signalled or started in the window the move
+/// would be made in.
+fn move_held(sb: &Sandbox, h: &Harness, name: &str, word: &str) {
+    sb.point_current(&sb.install(NEW));
+    let waits = format!("waits: {word} (");
+    h.wait_until(sb, &waits, |sb| sb.journal().contains(&waits));
+    // An absence: the window a move would be made in, had the hold not held.
+    std::thread::sleep(move_window());
+    assert!(
+        !sb.events().iter().any(|e| e.starts_with("term")),
+        "{name}: {:?}",
+        sb.events()
+    );
+    assert_eq!(sb.starts().len(), 1, "{name}");
+}
+
+/// The move made once aterm admits the claim again: the session resumed on the newer build.
+fn move_made(sb: &Sandbox, h: &Harness, name: &str) {
+    let second = h.wait_start(sb, 2);
+    assert_eq!(
+        field(&second, "argv"),
+        format!("[--trust-workspace][resume][{SESSION}]"),
+        "{name}"
+    );
+    assert_eq!(field(&second, "ppid"), h.pid.to_string(), "{name}");
+}
+
+/// A MOVE WAITS WHILE THE CLAIM IS LOST OR GIVEN BACK: a link lost and being claimed again (aterm
+/// restarted and does not prove the claim yet) holds every move (`no-claim`), and so does a claim
+/// given back while Autopilot is off (`policy-off`); the move is made once aterm admits the claim
+/// again.
+fn under_aterm_a_move_waits_while_the_claim_is_lost_or_given_back() {
+    for name in ["aterm-move-lost", "aterm-move-released"] {
+        let sb = Sandbox::new(name);
+        sb.point_current(&sb.install(OLD));
+        let aterm = fake_aterm(name);
+        let env = aterm.env();
+        let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+        h.wait_start(&sb, 1);
+        h.wait_until(&sb, "the claim and its announcement", |_| {
+            claims(&aterm).len() >= 2
+        });
+        if name == "aterm-move-lost" {
+            aterm.set_registered(false);
+            aterm.restart();
+            h.wait_until(&sb, "the link lost", |sb| sb.journal().contains(" LOST "));
+            move_held(&sb, &h, name, "no-claim");
+            aterm.set_registered(true);
+        } else {
+            aterm.set_policy(&policy_off());
+            h.wait_until(&sb, "the claim given back", |sb| {
+                sb.journal().contains(" RELEASED ")
             });
-            FakeAterm { sock, state }
+            move_held(&sb, &h, name, "policy-off");
+            aterm.set_policy(POLICY_ON);
         }
+        move_made(&sb, &h, name);
+        sb.send("exit 0");
+        assert_eq!(h.wait_exit(), Exit::Code(0), "{name}");
+    }
+}
 
-        /// Answer `harness policy` with `policy` from now on.
-        pub fn set_policy(&self, policy: &str) {
-            self.lock().policy = policy.to_string();
-        }
-
-        /// Prove a claim from now on when `prove`, else leave it unproven.
-        pub fn set_prove(&self, prove: bool) {
-            self.lock().prove = prove;
-        }
-
-        /// Forget the stored claim, as an aterm that no longer shows it.
-        pub fn forget_claim(&self) {
-            self.lock().holder = None;
-        }
-
-        /// Every request the fake was asked, in order.
-        pub fn requests(&self) -> Vec<String> {
-            self.lock().requests.clone()
-        }
-
-        fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-            self.state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// A MOVE WAITS UNTIL aterm ADMITS THE CLAIM: with Autopilot off at the launch the harness
+/// supervises Muse Code and claims every 5 s, but a move is aterm's `upgrade` duty and none was
+/// handed over, so atpkg's newer Muse Code waits (`no-claim`) until aterm admits the claim, and
+/// is moved onto then. Refused for good after such a launch (no registry row proves the claim),
+/// the link is absent for the session and every move waits for good, as a crash is passed on at
+/// once. NEGATIVE CONTROL: before, a link that never held a claim counted as outside aterm, and
+/// the harness moved with no grant and no read of aterm.
+fn under_aterm_a_move_waits_until_aterm_admits_the_claim() {
+    for name in ["aterm-move-unadmitted", "aterm-move-refused"] {
+        let sb = Sandbox::new(name);
+        sb.point_current(&sb.install(OLD));
+        let aterm = fake_aterm(name);
+        aterm.set_policy(&policy_off());
+        let env = aterm.env();
+        let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+        let first = h.wait_start(&sb, 1);
+        assert_eq!(field(&first, "ppid"), h.pid.to_string(), "{name}");
+        h.wait_until(&sb, "the claim not made", |sb| {
+            sb.journal().contains(" UNCLAIMED ")
+        });
+        if name == "aterm-move-unadmitted" {
+            move_held(&sb, &h, name, "no-claim");
+            assert!(claims(&aterm).is_empty(), "{name}: {:?}", aterm.verbs());
+            aterm.set_policy(POLICY_ON);
+            move_made(&sb, &h, name);
+            sb.send("exit 0");
+            assert_eq!(h.wait_exit(), Exit::Code(0), "{name}");
+        } else {
+            aterm.set_registered(false);
+            aterm.set_policy(POLICY_ON);
+            h.wait_until(&sb, "the claim refused", |sb| {
+                sb.journal().contains("unproven")
+            });
+            move_held(&sb, &h, name, "no-claim");
+            sb.send(&format!("crash {}", libc::SIGKILL));
+            assert_eq!(h.wait_exit(), Exit::Signal(libc::SIGKILL), "{name}");
+            assert_eq!(sb.starts().len(), 1, "{name}");
+            let j = sb.journal();
+            assert!(
+                j.contains("NO-RELAUNCH no-claim: aterm refused this harness's claim"),
+                "{name}: {j}"
+            );
         }
     }
+}
 
-    impl Drop for FakeAterm {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.sock);
-            let _ = std::fs::remove_file(self.sock.with_extension("sock.token"));
+/// UNDER ATERM A MOVE'S COMPOSER IS ATERM'S WORD (`status composer=`, contract 3's §8.1 item 9 in
+/// aterm's harness design): input after the last submission (a focus report, which types no draft
+/// but moves the terminal's input clock past the submission) holds no move while aterm reads the
+/// composer `empty`, and aterm's `draft` and `-` hold one. NEGATIVE CONTROL: the same input under an
+/// aterm that serves no `composer=` holds the move on the input clock (`draft-unproven`).
+fn under_aterm_a_move_waits_on_aterms_composer() {
+    for (name, served) in [("aterm-composer", true), ("aterm-no-composer", false)] {
+        let sb = Sandbox::new(name);
+        sb.point_current(&sb.install(OLD));
+        let aterm = fake_aterm(name);
+        if served {
+            aterm.set_status("composer", Some("draft"));
+        } else {
+            aterm.set_status("composer", None);
         }
-    }
-
-    fn serve(stream: UnixStream, state: &Mutex<State>) {
-        let Ok(mut out) = stream.try_clone() else {
-            return;
+        let env = aterm.env();
+        let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+        h.wait_start(&sb, 1);
+        next_second();
+        h.type_bytes(b"go\r");
+        sb.wait_event(&h, "submit", |e| e == "submit go");
+        next_second();
+        h.type_bytes(b"\x1b[I");
+        sb.wait_event(&h, "input", |e| e == "input \\x1b[I");
+        sb.point_current(&sb.install(NEW));
+        let held = |word: &str| {
+            let word = format!("waits: {word} (");
+            h.wait_until(&sb, &word, |sb| sb.journal().contains(&word));
         };
-        for line in BufReader::new(stream).lines() {
-            let Ok(line) = line else {
-                return;
-            };
-            if let Some(token) = line.strip_prefix("AUTH ") {
-                if token != TOKEN {
-                    let _ = out.write_all(b"ERR auth\n");
-                    return;
-                }
-                continue;
-            }
-            let reply = {
-                let mut st = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                st.requests.push(line.clone());
-                let verb = line.split_once(' ').map_or("", |(_, v)| v);
-                if line == "version" {
-                    "OK 0.0.0-fake".to_string()
-                } else if verb == "harness policy" {
-                    st.policy.clone()
-                } else if let Some(rest) = verb.strip_prefix("meta set supervisor ") {
-                    if st.prove {
-                        st.holder = rest.split(' ').next().map(str::to_string);
-                    }
-                    "OK".to_string()
-                } else if verb.starts_with("meta unset supervisor") {
-                    st.holder = None;
-                    "OK".to_string()
-                } else if verb == "status" {
-                    format!(
-                        "OK schema=1 human_ms=- supervisor={} supervisor_proven={}",
-                        st.holder.as_deref().unwrap_or("-"),
-                        u8::from(st.holder.is_some())
-                    )
-                } else {
-                    format!("ERR unknown {verb}")
-                }
-            };
-            if out.write_all(format!("{reply}\n").as_bytes()).is_err() {
-                return;
-            }
+        if served {
+            held("draft");
+            aterm.set_status("composer", Some("-"));
+            held("composer-unproven");
+            assert!(!sb.events().iter().any(|e| e.starts_with("term")));
+            assert_eq!(sb.starts().len(), 1);
+            aterm.set_status("composer", Some("empty"));
+            let second = h.wait_start(&sb, 2);
+            assert_eq!(
+                field(&second, "argv"),
+                format!("[--trust-workspace][resume][{SESSION}]")
+            );
+            assert_eq!(field(&second, "ppid"), h.pid.to_string());
+        } else {
+            held("draft-unproven");
+            // An absence: the window a move would be made in, had the hold not held.
+            std::thread::sleep(move_window());
+            assert!(
+                !sb.events().iter().any(|e| e.starts_with("term")),
+                "{name}: {:?}",
+                sb.events()
+            );
+            assert_eq!(sb.starts().len(), 1, "{name}");
         }
+        sb.send("exit 0");
+        assert_eq!(h.wait_exit(), Exit::Code(0), "{name}");
     }
+}
+
+/// THE HARNESS'S OWN UPDATE (aterm's harness design §4.5): with a newer build of the harness in
+/// the store, at the same safe point a move waits for, the harness `execve`s it in its own process
+/// (the same pid now runs the new build's image) and the child runs on untouched: never
+/// signalled, never started again. The episode crossed: a vendor move afterwards resumes the same
+/// session with the launch's resume argv, on a terminal put back to the mode the FIRST image found
+/// (cooked), not the raw mode the child held when the new image started. NEGATIVE CONTROL: a
+/// build that does not answer this protocol (`--alab-adopt-probe`) is never exec'd into.
+fn moves_itself_onto_a_newer_build_of_itself_at_a_safe_point() {
+    let sb = Sandbox::new("reexec");
+    sb.point_current(&sb.install(OLD));
+    let first = sb.install_harness(1, None);
+    let launch: Vec<OsString> = ["--trust-workspace", "--model", "m1", "hello prompt"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    let mut h = sb.spawn_from(&first, &launch, &[]);
+    let start = h.wait_start(&sb, 1);
+    assert_eq!(field(&start, "icanon"), "1", "the terminal starts cooked");
+    assert_eq!(exe_of(h.pid), Some(canonical(&first)));
+    next_second();
+    h.type_bytes(b"go\r");
+    sb.wait_event(&h, "submit", |e| e == "submit go");
+    let alien = sb.install_harness(2, Some("echo muse-alab-adopt 0"));
+    h.wait_until(&sb, "the unproved build's hold", |sb| {
+        sb.journal().contains("-> build 2 waits: build-unproved")
+    });
+    assert!(
+        sb.journal().contains(&format!(
+            "build 2: `{} --alab-adopt-probe` exited",
+            alien.display()
+        )),
+        "{}",
+        sb.journal()
+    );
+    assert_eq!(exe_of(h.pid), Some(canonical(&first)), "never exec'd into");
+    let next = sb.install_harness(3, None);
+    h.wait_until(&sb, "the new image", |_| {
+        exe_of(h.pid) == Some(canonical(&next))
+    });
+    h.wait_until(&sb, "the adoption", |sb| sb.journal().contains(" ADOPTED "));
+    let j = sb.journal();
+    assert!(
+        j.contains(&format!(
+            "REEXEC muse-alab {VERSION} (build 1) -> build 3 ({})",
+            next.display()
+        )),
+        "{j}"
+    );
+    assert!(
+        !sb.events().iter().any(|e| e.starts_with("term")),
+        "the child was never signalled: {:?}",
+        sb.events()
+    );
+    assert_eq!(sb.starts().len(), 1, "the child ran on");
+    sb.point_current(&sb.install(NEW));
+    let second = h.wait_start(&sb, 2);
+    assert_eq!(
+        field(&second, "argv"),
+        format!("[--trust-workspace][resume][{SESSION}]")
+    );
+    assert_eq!(field(&second, "ppid"), h.pid.to_string());
+    assert_eq!(
+        field(&second, "icanon"),
+        "1",
+        "the terminal's starting mode crossed the re-exec"
+    );
+    sb.send("exit 3");
+    assert_eq!(h.wait_exit(), Exit::Code(3));
+}
+
+/// UNDER ATERM THE HARNESS'S OWN MOVE waits on aterm's word like a vendor move (here a served
+/// `composer=draft` holds it), and the new image claims again under the same pid with the child
+/// it took over: the old image's connections closed with the exec (they are close-on-exec), the
+/// claim names the same holder and `child=`, and the next act waits on a fresh read under it.
+fn under_aterm_its_own_move_waits_on_aterm_and_claims_again_under_the_same_pid() {
+    let sb = Sandbox::new("aterm-reexec");
+    sb.point_current(&sb.install(OLD));
+    let aterm = fake_aterm("aterm-reexec");
+    aterm.set_status("composer", Some("draft"));
+    let first = sb.install_harness(1, None);
+    let env = aterm.env();
+    let mut h = sb.spawn_from(&first, &["--trust-workspace".into()], &pairs(&env));
+    let start = h.wait_start(&sb, 1);
+    let child = field(&start, "pid");
+    h.wait_until(&sb, "the claim and its announcement", |_| {
+        claims(&aterm).len() >= 2
+    });
+    next_second();
+    h.type_bytes(b"go\r");
+    sb.wait_event(&h, "submit", |e| e == "submit go");
+    let next = sb.install_harness(2, None);
+    h.wait_until(&sb, "aterm's draft holding it", |sb| {
+        sb.journal().contains("-> build 2 waits: draft (")
+    });
+    assert_eq!(exe_of(h.pid), Some(canonical(&first)));
+    aterm.set_status("composer", Some("empty"));
+    h.wait_until(&sb, "the claim made again by the new image", |sb| {
+        sb.journal().contains(" ADOPTED ") && notes(&sb.journal(), "CLAIMED") >= 2
+    });
+    assert_eq!(exe_of(h.pid), Some(canonical(&next)));
+    let sent = claims(&aterm);
+    assert!(
+        sent.len() >= 3
+            && sent[2].starts_with(&format!("{} vendor={OLD} child={child}:", claim_of(h.pid))),
+        "claimed at the start, announced with the child, and claimed again after the exec: {sent:?}"
+    );
+    assert_eq!(aterm.holder(), Some(format!("muse-alab@{}", h.pid)));
+    let before = aterm.verbs().len();
+    sb.send(&format!("crash {}", libc::SIGKILL));
+    let second = h.wait_start(&sb, 2);
+    assert_eq!(field(&second, "ppid"), h.pid.to_string());
+    let fresh: Vec<String> = aterm.verbs().split_off(before);
+    assert!(
+        fresh.iter().any(|v| v == "status"),
+        "the relaunch waited on a fresh read under the new claim: {fresh:?}"
+    );
+    sb.send("exit 0");
+    assert_eq!(h.wait_exit(), Exit::Code(0));
+}
+
+/// The executable process `pid` runs now.
+fn exe_of(pid: libc::pid_t) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = vec![0u8; 4096];
+        let size = u32::try_from(buf.len()).ok()?;
+        // SAFETY: proc_pidpath writes at most `size` bytes into `buf`, which holds that many.
+        let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), size) };
+        let n = usize::try_from(n).ok().filter(|&n| n > 0)?;
+        buf.truncate(n);
+        fs::canonicalize(PathBuf::from(OsString::from_vec(buf))).ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fs::canonicalize(format!("/proc/{pid}/exe")).ok()
+    }
+}
+
+fn canonical(p: &Path) -> PathBuf {
+    fs::canonicalize(p).expect("canonical")
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1364,6 +2472,31 @@ impl Sandbox {
         dir
     }
 
+    /// Install the harness under test as its own program's build `build` (a copy: each build
+    /// its own file, so the image a process runs names its build), or, with `script`, a shell
+    /// script in its place, and point that program's `current` at it as atpkg does. Its binary.
+    fn install_harness(&self, build: u64, script: Option<&str>) -> PathBuf {
+        let program = self.prefix().join("store").join("muse-alab");
+        let dir = program.join(build.to_string());
+        fs::create_dir_all(dir.join("bin")).expect("build dir");
+        let bin = dir.join("bin").join("muse-alab");
+        match script {
+            Some(body) => {
+                fs::write(&bin, format!("#!/bin/sh\n{body}\n")).expect("script");
+                fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).expect("mode");
+            }
+            None => {
+                fs::copy(HARNESS, &bin).expect("install the harness");
+            }
+        }
+        fs::write(dir.with_extension("ready"), "ok\n").expect("ready");
+        let tmp = program.join(".current.tmp");
+        let _ = fs::remove_file(&tmp);
+        symlink(build.to_string(), &tmp).expect("link");
+        fs::rename(&tmp, program.join("current")).expect("swap");
+        bin
+    }
+
     /// Point `current` at `dir` the way atpkg does: a new link renamed over the old.
     fn point_current(&self, dir: &Path) {
         let tmp = self.program_dir().join(".current.tmp");
@@ -1379,7 +2512,11 @@ impl Sandbox {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(HARNESS);
+        self.command_for(Path::new(HARNESS))
+    }
+
+    fn command_for(&self, exe: &Path) -> Command {
+        let mut cmd = Command::new(exe);
         cmd.env_clear()
             .env("HOME", self.root.join("home"))
             .env("XDG_DATA_HOME", self.root.join("data"))
@@ -1400,11 +2537,40 @@ impl Sandbox {
         self.spawn_with(args, env, &[], None)
     }
 
+    /// [`Sandbox::spawn`] of the harness binary `exe` (one installed in the store).
+    fn spawn_from(&self, exe: &Path, args: &[OsString], env: &[(&str, &str)]) -> Harness {
+        self.spawn_cmd(self.command_for(exe), args, env, &[], None)
+    }
+
+    /// A non-interactive `/bin/sh -c script` as the session's leader and foreground job on a new
+    /// pseudo-terminal, `$0` naming the harness under test: the harness is then one command of a
+    /// shell sharing its terminal, which reads the terminal again once the harness has ended.
+    fn spawn_under_shell(&self, script: &str, env: &[(&str, &str)]) -> Harness {
+        self.spawn_cmd(
+            self.command_for(Path::new("/bin/sh")),
+            &["-c".into(), script.into(), HARNESS.into()],
+            env,
+            &[],
+            None,
+        )
+    }
+
     /// [`Sandbox::spawn`], with `ignore` left ignored for it (as `nohup` leaves `SIGHUP`;
     /// SIGINT, SIGQUIT, SIGHUP and SIGTERM are otherwise reset to their defaults, whatever
     /// this test runner inherited) and `stderr` in place of the terminal when given.
     fn spawn_with(
         &self,
+        args: &[OsString],
+        env: &[(&str, &str)],
+        ignore: &[libc::c_int],
+        stderr: Option<File>,
+    ) -> Harness {
+        self.spawn_cmd(self.command(), args, env, ignore, stderr)
+    }
+
+    fn spawn_cmd(
+        &self,
+        mut cmd: Command,
         args: &[OsString],
         env: &[(&str, &str)],
         ignore: &[libc::c_int],
@@ -1437,7 +2603,6 @@ impl Sandbox {
         }
         // SAFETY: openpty returned these descriptors and nothing else owns them.
         let (master, slave) = unsafe { (File::from_raw_fd(m), File::from_raw_fd(s)) };
-        let mut cmd = self.command();
         let err = match stderr {
             Some(f) => Stdio::from(f),
             None => Stdio::from(slave.try_clone().expect("dup")),
@@ -1694,6 +2859,47 @@ impl Drop for Harness {
     }
 }
 
+/// The CPU time (user and system) the process `pid` has used so far: `/proc/<pid>/stat`'s
+/// `utime` and `stime` on Linux.
+#[cfg(target_os = "linux")]
+fn cpu_time(pid: libc::pid_t) -> Duration {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("the process's stat");
+    // Fields 14 and 15; the first field after the command's `)` is field 3.
+    let fields: Vec<&str> = stat
+        .rsplit_once(')')
+        .expect("a command in parentheses")
+        .1
+        .split_whitespace()
+        .collect();
+    let ticks: u64 =
+        fields[11].parse::<u64>().expect("utime") + fields[12].parse::<u64>().expect("stime");
+    // SAFETY: sysconf takes a plain integer.
+    let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).expect("clock ticks");
+    Duration::from_millis(ticks * 1000 / hz)
+}
+
+/// The CPU time (user and system) the process `pid` has used so far: `ps`'s `time`,
+/// `[[dd-]hh:]mm:ss.cc` on macOS.
+#[cfg(not(target_os = "linux"))]
+fn cpu_time(pid: libc::pid_t) -> Duration {
+    let out = Command::new("/bin/ps")
+        .args(["-o", "time=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let text = text.trim();
+    let (days, clock) = text
+        .split_once('-')
+        .map_or((0.0, text), |(d, c)| (d.parse().expect("ps days"), c));
+    let secs = clock.split(':').fold(0.0, |acc, part| {
+        acc * 60.0
+            + part
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("ps time {text:?}"))
+    });
+    Duration::from_secs_f64(days * 86_400.0 + secs)
+}
+
 /// Sleep into the next wall-clock second (and a little past its start).
 fn next_second() {
     let now = SystemTime::now()
@@ -1910,6 +3116,8 @@ mod fake {
         open_run: Option<String>,
         tool: Option<std::process::Child>,
         ignore_term: bool,
+        /// Stop (as `stop` does) as soon as a SIGTERM was ignored.
+        stop_on_term: bool,
         composer: Vec<u8>,
         deaf: bool,
     }
@@ -1996,8 +3204,10 @@ mod fake {
                     self.event("end-turn");
                 }
                 "tool" => {
+                    // Longer than any test runs: the tool ends only by `untool` or with the
+                    // job, never by a clock on a slow machine.
                     let child = Command::new("/bin/sleep")
-                        .arg("60")
+                        .arg("3600")
                         .stdin(Stdio::null())
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
@@ -2014,7 +3224,9 @@ mod fake {
                     self.event("untool");
                 }
                 "ignore-term" => {
+                    // `ignore-term stop`: and stop as soon as one was ignored.
                     self.ignore_term = true;
+                    self.stop_on_term = arg == "stop";
                     self.event("ignore-term");
                 }
                 "deaf" => {
@@ -2145,6 +3357,7 @@ mod fake {
             open_run: None,
             tool: None,
             ignore_term: false,
+            stop_on_term: false,
             composer: Vec::new(),
             deaf: false,
         };
@@ -2176,6 +3389,7 @@ mod fake {
         }
         // SAFETY: isatty and getppid take plain integers.
         let (tty, ppid) = unsafe { (libc::isatty(0) == 1, libc::getppid()) };
+        let mut icanon = "-";
         if tty {
             // Raw input, as a TUI sets it: every key reaches a read, no echo; signals
             // from keys stay on.
@@ -2183,6 +3397,12 @@ mod fake {
             unsafe {
                 let mut t: libc::termios = std::mem::zeroed();
                 if libc::tcgetattr(0, &raw mut t) == 0 {
+                    // The mode it found: cooked (`1`) as a shell leaves the terminal, or raw.
+                    icanon = if t.c_lflag & libc::ICANON == 0 {
+                        "0"
+                    } else {
+                        "1"
+                    };
                     t.c_lflag &= !(libc::ICANON | libc::ECHO | libc::IEXTEN);
                     t.c_cc[libc::VMIN] = 1;
                     t.c_cc[libc::VTIME] = 0;
@@ -2192,7 +3412,7 @@ mod fake {
         }
         let shown: String = args[1..].iter().map(|a| show(a)).collect();
         fake.event(&format!(
-            "start pid={pid} ppid={ppid} tty={} ign={ignores} exe={} argv={shown}",
+            "start pid={pid} ppid={ppid} tty={} ign={ignores} icanon={icanon} exe={} argv={shown}",
             u8::from(tty),
             Path::new(&args[0]).display()
         ));
@@ -2200,6 +3420,9 @@ mod fake {
             if TERM.swap(false, Ordering::SeqCst) {
                 if fake.ignore_term {
                     fake.event("term-ignored");
+                    if fake.stop_on_term {
+                        fake.command("stop");
+                    }
                 } else {
                     fake.event("term");
                     die_by(libc::SIGTERM);

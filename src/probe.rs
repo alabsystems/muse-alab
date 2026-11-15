@@ -62,28 +62,58 @@ impl Probe {
 /// harness's recursion marks), for at most `limit`.
 #[must_use]
 pub fn probe_within(exe: &Path, envs: &[(&str, String)], limit: Duration) -> Probe {
+    run_within(exe, PROBE_ARG, envs, limit, false).0
+}
+
+/// Run `exe <arg>` as [`probe_within`] runs its probe, keeping what it had written to stdout when
+/// it exited (at most `MAX_SAID` bytes, read without waiting, so a process it left behind holding
+/// the pipe cannot hold the harness): the harness's probe of a newer build of itself, which must
+/// answer its adoption protocol ([`crate::adopt`]).
+#[must_use]
+pub fn said_within(
+    exe: &Path,
+    arg: &str,
+    envs: &[(&str, String)],
+    limit: Duration,
+) -> (Probe, Vec<u8>) {
+    run_within(exe, arg, envs, limit, true)
+}
+
+/// The most of a probe's stdout [`said_within`] keeps; a probe that writes more than a pipe
+/// holds without being read blocks and is ended at its bound.
+const MAX_SAID: u64 = 4096;
+
+fn run_within(
+    exe: &Path,
+    arg: &str,
+    envs: &[(&str, String)],
+    limit: Duration,
+    keep: bool,
+) -> (Probe, Vec<u8>) {
     let deadline = Instant::now() + limit;
     let mut cmd = Command::new(exe);
-    cmd.arg(PROBE_ARG)
+    cmd.arg(arg)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(if keep { Stdio::piped() } else { Stdio::null() })
         .stderr(Stdio::null())
         .process_group(0);
     for (k, v) in envs {
         cmd.env(k, v);
     }
     let Ok(mut child) = cmd.spawn() else {
-        return Probe::NoExec;
+        return (Probe::NoExec, Vec::new());
     };
     let group = libc::pid_t::try_from(child.id()).ok();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                return if status.success() {
+                let said = child.stdout.take().map(drain).unwrap_or_default();
+                let found = if status.success() {
                     Probe::Starts
                 } else {
                     Probe::Exited
                 };
+                return (found, said);
             }
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
@@ -101,10 +131,28 @@ pub fn probe_within(exe: &Path, envs: &[(&str, String)], limit: Duration) -> Pro
                 }
                 let _ = child.kill();
                 let _ = child.wait();
-                return Probe::TimedOut;
+                return (Probe::TimedOut, Vec::new());
             }
         }
     }
+}
+
+/// What waits in a probe's stdout pipe, read without blocking, at most [`MAX_SAID`] bytes.
+fn drain(out: std::process::ChildStdout) -> Vec<u8> {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    let fd = out.as_raw_fd();
+    // SAFETY: fcntl on the pipe this process owns (the child handle's stdout).
+    let nonblocking = unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
+    };
+    let mut said = Vec::new();
+    if nonblocking {
+        // A read that would block ends it: what the probe wrote before it exited is there.
+        let _ = out.take(MAX_SAID).read_to_end(&mut said);
+    }
+    said
 }
 
 #[cfg(test)]

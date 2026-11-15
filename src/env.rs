@@ -48,13 +48,10 @@ pub struct Env {
     pub parent_mark: Option<OsString>,
     /// [`DEPTH_VAR`] as inherited.
     pub depth_mark: Option<OsString>,
-    /// This process runs in an aterm tab (`TERM_PROGRAM=aterm` or `ATERM_CHILD=1`), where the
-    /// start sequence asks aterm for a claim ([`crate::aterm`]).
-    pub under_aterm: bool,
-    /// `ATERM_PARENT_SESSION_ID`, the tab's session ([`crate::aterm::SID_ENV`]).
-    pub aterm_sid: Option<OsString>,
-    /// `XDG_RUNTIME_DIR`, when non-empty (aterm's rendezvous directory's home).
-    pub xdg_runtime_dir: Option<OsString>,
+    /// The variables `alab-wire` reads a session from, as inherited: the names its
+    /// [`alab_wire::EnvNames`] lists for this harness (the tab's session, the rendezvous
+    /// directory's homes, and the marks of an aterm tab), read through [`Env::aterm_var`].
+    pub aterm: Vec<(String, OsString)>,
 }
 
 impl Env {
@@ -72,11 +69,33 @@ impl Env {
             no_harness: get(NO_HARNESS_ENV).is_some_and(|v| v != "0"),
             parent_mark: std::env::var_os(PARENT_VAR),
             depth_mark: std::env::var_os(DEPTH_VAR),
-            under_aterm: get("TERM_PROGRAM").is_some_and(|v| v == "aterm")
-                || get("ATERM_CHILD").is_some_and(|v| v == "1"),
-            aterm_sid: get(crate::aterm::SID_ENV),
-            xdg_runtime_dir: get("XDG_RUNTIME_DIR"),
+            aterm: aterm_names()
+                .into_iter()
+                .filter_map(|name| std::env::var_os(&name).map(|value| (name, value)))
+                .collect(),
         }
+    }
+
+    /// An environment holding only these aterm variables (a test's, or a caller's that read
+    /// them elsewhere).
+    #[must_use]
+    pub fn with_aterm_vars(pairs: &[(&str, &str)]) -> Self {
+        Self {
+            aterm: pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), OsString::from(value)))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// The aterm variable `name` as inherited ([`Env::aterm`]).
+    #[must_use]
+    pub fn aterm_var(&self, name: &str) -> Option<OsString> {
+        self.aterm
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, value)| value.clone())
     }
 
     /// `HOME`, when absolute.
@@ -84,6 +103,21 @@ impl Env {
     pub fn home(&self) -> Option<&Path> {
         self.home.as_deref()
     }
+}
+
+/// Every variable `alab-wire` reads a session from for this harness ([`crate::aterm::config`]).
+fn aterm_names() -> Vec<String> {
+    let config = crate::aterm::config();
+    let names = config.env();
+    let mut out = vec![
+        names.session.clone(),
+        names.runtime_dir.clone(),
+        names.home.clone(),
+    ];
+    out.extend(names.hosted.iter().map(|mark| mark.name.clone()));
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Whether the inherited [`PARENT_VAR`] names `parent` or `me`: this process was started as
@@ -198,6 +232,25 @@ mod tests {
             u32::MAX.to_string(),
             "saturates"
         );
+    }
+
+    /// The variables a session is read from are alab-wire's names for them, each once.
+    #[test]
+    fn the_aterm_variables_are_alab_wires_names() {
+        let names = aterm_names();
+        for name in [
+            "ATERM_PARENT_SESSION_ID",
+            "XDG_RUNTIME_DIR",
+            "HOME",
+            "TERM_PROGRAM",
+            "ATERM_CHILD",
+            "ATERM_SESSION_ID",
+        ] {
+            assert!(names.iter().any(|n| n == name), "{name}: {names:?}");
+        }
+        let env = Env::with_aterm_vars(&[("TERM_PROGRAM", "aterm")]);
+        assert_eq!(env.aterm_var("TERM_PROGRAM"), Some(OsString::from("aterm")));
+        assert_eq!(env.aterm_var("ATERM_CHILD"), None);
     }
 
     #[test]

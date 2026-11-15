@@ -6,8 +6,9 @@
 //!
 //! - `SIGINT` and `SIGQUIT` belong to the child: the terminal delivers them to the whole
 //!   foreground group, so the child already has them. The harness catches them and does
-//!   nothing (a caught signal, unlike an ignored one, reverts to default in the child at
-//!   `exec`, so the child keeps its own disposition).
+//!   nothing while a child runs (a caught signal, unlike an ignored one, reverts to default in
+//!   the child at `exec`, so the child keeps its own disposition); while a crash relaunch waits
+//!   and no child runs, one ends the session ([`Pending::int`]).
 //! - `SIGTSTP` keeps its default: the harness stops with its group, and when the child
 //!   stops on its own the harness follows it ([`stop_self`]), so the shell sees the job
 //!   stopped.
@@ -53,9 +54,31 @@ pub struct Pending {
     pub chld: bool,
     /// `SIGCONT` (this process was continued).
     pub cont: bool,
+    /// `SIGINT` or `SIGQUIT`: the child's own while it runs, but whoever sends one while no
+    /// child runs (a crash relaunch waiting) wants the session over.
+    pub int: bool,
 }
 
 impl Pending {
+    /// What arrived in `self` or in `other`.
+    #[must_use]
+    pub fn or(self, other: Pending) -> Pending {
+        Pending {
+            hup: self.hup || other.hup,
+            term: self.term || other.term,
+            chld: self.chld || other.chld,
+            cont: self.cont || other.cont,
+            int: self.int || other.int,
+        }
+    }
+
+    /// Whether a signal arrived that the loop must act on before anything else: `SIGHUP`,
+    /// `SIGTERM` or `SIGCONT`.
+    #[must_use]
+    pub fn acts(self) -> bool {
+        self.hup || self.term || self.cont
+    }
+
     /// Note that `sig` arrived (one the loop does not act on changes nothing).
     fn note(&mut self, sig: libc::c_int) {
         match sig {
@@ -63,6 +86,7 @@ impl Pending {
             libc::SIGTERM => self.term = true,
             libc::SIGCHLD => self.chld = true,
             libc::SIGCONT => self.cont = true,
+            libc::SIGINT | libc::SIGQUIT => self.int = true,
             _ => {}
         }
     }
@@ -123,6 +147,11 @@ mod wake {
             }
             // SAFETY: kqueue(2) just returned this descriptor, owned by nothing else.
             let kq = unsafe { OwnedFd::from_raw_fd(kq) };
+            // Close-on-exec: the harness's own re-exec ([`crate::adopt`]) installs a new one.
+            // SAFETY: fcntl on the descriptor just made, owned here.
+            if unsafe { libc::fcntl(kq.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
             Ok(Self { kq })
         }
 
@@ -216,6 +245,7 @@ mod wake {
             libc::SIGTERM => 2,
             libc::SIGCHLD => 4,
             libc::SIGCONT => 8,
+            libc::SIGINT | libc::SIGQUIT => 16,
             _ => 0,
         }
     }
@@ -395,6 +425,100 @@ impl Signals {
     }
 }
 
+/// The caught signals as a BSD signal mask: signal `n` is bit `n - 1` (`<sys/signal.h>`,
+/// `sigmask`).
+#[cfg(target_os = "macos")]
+const CAUGHT_BITS: libc::c_int = (1 << (libc::SIGINT - 1))
+    | (1 << (libc::SIGQUIT - 1))
+    | (1 << (libc::SIGHUP - 1))
+    | (1 << (libc::SIGTERM - 1))
+    | (1 << (libc::SIGCHLD - 1))
+    | (1 << (libc::SIGCONT - 1));
+
+#[cfg(target_os = "macos")]
+// SAFETY: the two BSD mask calls of macOS's libSystem (`<signal.h>`), with their C signatures;
+// each takes and returns a plain integer mask.
+unsafe extern "C" {
+    /// `sigblock(2)`: add `mask` to this thread's blocked signals; the mask before.
+    fn sigblock(mask: libc::c_int) -> libc::c_int;
+    /// `sigsetmask(2)`: set this thread's blocked signals to `mask`; the mask before.
+    fn sigsetmask(mask: libc::c_int) -> libc::c_int;
+}
+
+/// Block (`SIG_BLOCK`) or unblock (`SIG_UNBLOCK`) the caught signals, through the BSD integer
+/// masks: no `sigset_t` is passed by pointer.
+#[cfg(target_os = "macos")]
+fn mask(how: libc::c_int) -> io::Result<()> {
+    // SAFETY: sigblock and sigsetmask take and return integers and touch no memory of ours.
+    unsafe {
+        if how == libc::SIG_BLOCK {
+            sigblock(CAUGHT_BITS);
+        } else {
+            let now = sigblock(0);
+            sigsetmask(now & !CAUGHT_BITS);
+        }
+    }
+    Ok(())
+}
+
+/// Block (`SIG_BLOCK`) or unblock (`SIG_UNBLOCK`) the caught signals, one at a time.
+#[cfg(not(target_os = "macos"))]
+fn mask(how: libc::c_int) -> io::Result<()> {
+    for sig in CAUGHT {
+        // SAFETY: an all-zero `sigset_t` is a valid value of the plain C type, emptied and given
+        // `sig` by sigemptyset and sigaddset on a valid, writable set that lives in this block
+        // for the sigprocmask call that reads it; no old mask is asked for.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut set);
+            libc::sigaddset(&raw mut set, sig);
+            if libc::sigprocmask(how, &set, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Block the caught signals, for the harness's own re-exec ([`crate::adopt`]): the blocked mask
+/// and the signals pending under it cross `execve`, while each caught signal's handler reverts
+/// to its default there (a `SIGINT` from the keyboard would otherwise end the harness between
+/// the two images). The new image collects them with [`take_blocked`].
+///
+/// # Errors
+/// `sigprocmask` failed.
+pub fn block_caught() -> io::Result<()> {
+    mask(libc::SIG_BLOCK)
+}
+
+/// Unblock the caught signals again (a re-exec that did not happen).
+pub fn unblock_caught() {
+    let _ = mask(libc::SIG_UNBLOCK);
+}
+
+/// In the new image after a re-exec, once [`install`] has run: what was posted while the old
+/// image held the caught signals blocked ([`block_caught`]), read with `sigpending`, and the
+/// signals unblocked. A signal posted after [`install`] registered it is also in the wake's
+/// next wait; noting it twice changes nothing.
+#[must_use]
+pub fn take_blocked() -> Pending {
+    let mut pending = Pending::default();
+    // SAFETY: an all-zero `sigset_t` is a valid out-slot for sigpending; sigismember reads a
+    // valid set.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        if libc::sigpending(&raw mut set) == 0 {
+            for sig in CAUGHT {
+                if libc::sigismember(&raw const set, sig) == 1 {
+                    pending.note(sig);
+                }
+            }
+        }
+    }
+    unblock_caught();
+    pending
+}
+
 /// Send `sig` to `pid`; whether the kernel took it.
 pub fn send(pid: u32, sig: libc::c_int) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
@@ -475,6 +599,32 @@ mod tests {
             t.elapsed() < Duration::from_secs(4),
             "it did not wait out the timeout"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_caught_bits_are_the_set_sigaddset_makes_and_block_and_unblock() {
+        // SAFETY: an all-zero `sigset_t` is valid; sigemptyset and sigaddset write it in place.
+        let made = unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut set);
+            for sig in CAUGHT {
+                libc::sigaddset(&raw mut set, sig);
+            }
+            set
+        };
+        assert_eq!(libc::sigset_t::try_from(CAUGHT_BITS).ok(), Some(made));
+        // This test's own thread: blocked, then unblocked again, nothing else changed.
+        // SAFETY: sigblock(0) only reads this thread's mask.
+        let before = unsafe { sigblock(0) };
+        block_caught().expect("block");
+        // SAFETY: as above.
+        let blocked = unsafe { sigblock(0) };
+        assert_eq!(blocked, before | CAUGHT_BITS);
+        unblock_caught();
+        // SAFETY: as above.
+        let after = unsafe { sigblock(0) };
+        assert_eq!(after, before & !CAUGHT_BITS);
     }
 
     #[test]

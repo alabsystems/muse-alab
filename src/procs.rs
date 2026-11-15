@@ -157,15 +157,78 @@ pub fn is_stopped(pid: u32) -> Option<bool> {
 mod tests {
     use super::*;
 
+    /// A shell in its own process group (`process_group(0)`, so its pgid is its pid), whose
+    /// whole group is killed when the test ends, so neither the shell nor anything it started
+    /// outlives the test, even one that fails part way.
+    struct Group {
+        sh: std::process::Child,
+        pgid: libc::pid_t,
+        ended: bool,
+    }
+
+    impl Group {
+        fn spawn(script: &str) -> Self {
+            use std::os::unix::process::CommandExt as _;
+            let sh = std::process::Command::new("/bin/sh")
+                .args(["-c", script])
+                .process_group(0)
+                .spawn()
+                .expect("spawn");
+            let pgid = libc::pid_t::try_from(sh.id()).expect("pid fits");
+            Self {
+                sh,
+                pgid,
+                ended: false,
+            }
+        }
+
+        fn kill_all(&mut self) {
+            // SAFETY: kill(2) on the shell's OWN process group, sent before the shell is
+            // reaped, so the pgid is still its group's; never this test process's group.
+            unsafe {
+                libc::kill(-self.pgid, libc::SIGKILL);
+            }
+            let _ = self.sh.wait();
+        }
+
+        /// Kills the group and waits until no member is left: the event that says nothing it
+        /// started is still running.
+        fn end(mut self) {
+            self.kill_all();
+            // A deadline, not a window: the sleeps' new parent reaps them when it gets to it.
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                // SAFETY: signal 0 only checks that the group has a member.
+                let alive = unsafe { libc::kill(-self.pgid, 0) } == 0;
+                if !alive {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "the shell's group still has a member 30 s after it was killed"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            self.ended = true;
+        }
+    }
+
+    impl Drop for Group {
+        fn drop(&mut self) {
+            if !self.ended {
+                self.kill_all();
+            }
+        }
+    }
+
     #[test]
     fn the_walk_counts_children_and_grandchildren() {
-        let mut kid = std::process::Command::new("/bin/sh")
-            .args(["-c", "/bin/sleep 5 & /bin/sleep 5; wait"])
-            .spawn()
-            .expect("spawn");
-        let kid_pid = kid.id();
+        let group = Group::spawn("/bin/sleep 60 & /bin/sleep 60; wait");
+        let kid_pid = group.sh.id();
         let mut seen = None;
-        for _ in 0..100 {
+        // A deadline, not a window: a loaded machine can take seconds to start the sleeps.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < until {
             seen = descendants(kid_pid);
             if seen == Some(2) {
                 break;
@@ -179,7 +242,6 @@ mod tests {
             "sh and its sleeps are this process's descendants: {mine}"
         );
         assert_eq!(is_stopped(kid_pid), Some(false));
-        let _ = kid.kill();
-        let _ = kid.wait();
+        group.end();
     }
 }

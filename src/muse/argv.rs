@@ -248,6 +248,28 @@ pub fn rewrite_argv(argv: &[String], session: Option<&str>) -> Result<Vec<String
     Ok(out)
 }
 
+/// The resume arguments `args` ([`rewrite_argv`] with a session) started on `model`: Muse Code's
+/// root option `--model=<model>` (one value, attached so no model word is read as an option)
+/// before the `resume` subcommand, as a launch names it. aterm names a model on a restart
+/// (`restart … model=<word>`, a word `alab-wire` checked: ASCII, no leading `-`). The option is
+/// one a relaunch otherwise drops, since the session keeps the model it ran (the flag table); a
+/// later relaunch of this child drops it the same way, the session keeping the model it now
+/// runs.
+///
+/// # Errors
+/// The arguments name no `resume` to put the model before.
+pub fn with_model(args: &[String], model: &str) -> Result<Vec<String>, ArgvRefusal> {
+    let at = args
+        .iter()
+        .rposition(|word| word == "resume")
+        .filter(|at| at + 2 == args.len())
+        .ok_or_else(|| ArgvRefusal::NotResumable("model without a resume".to_string()))?;
+    let mut out = args[..at].to_vec();
+    out.push(format!("--model={model}"));
+    out.extend_from_slice(&args[at..]);
+    Ok(out)
+}
+
 /// Whether `s` is a hyphenated 8-4-4-4-12 hex UUID (a Muse Code session id).
 #[must_use]
 pub fn is_session_uuid(s: &str) -> bool {
@@ -266,6 +288,28 @@ mod tests {
 
     fn argv(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| (*w).to_string()).collect()
+    }
+
+    /// A restart aterm names a model for starts Muse Code on it: `--model=<word>` among the root
+    /// options, before `resume`, which the grammar reads back as the launch's model (and a later
+    /// relaunch drops, as it drops every `--model`). A launch's own `--model` is gone already.
+    #[test]
+    fn a_model_restart_names_the_model_before_resume() {
+        let launch = argv(&[STORE, "--trust-workspace", "--model", "m1", "hello"]);
+        let resume = rewrite_argv(&launch, Some(S1)).unwrap();
+        let moved = with_model(&resume, "lab/m2:latest").unwrap();
+        assert_eq!(
+            moved,
+            argv(&["--trust-workspace", "--model=lab/m2:latest", "resume", S1])
+        );
+        let again: Vec<String> = std::iter::once(STORE.to_string()).chain(moved).collect();
+        assert!(is_tui_argv(&again));
+        assert_eq!(
+            rewrite_argv(&again, Some(S1)).unwrap(),
+            argv(&["--trust-workspace", "resume", S1])
+        );
+        assert!(with_model(&argv(&["--trust-workspace"]), "m2").is_err());
+        assert!(with_model(&argv(&["resume", S1, "x"]), "m2").is_err());
     }
 
     const S1: &str = "01a148f8-9301-7752-96db-fef456f88074";

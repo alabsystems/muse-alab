@@ -16,19 +16,23 @@
 //!   running: at a proven safe point ([`gate`]), with the new build proved to start
 //!   ([`probe`]), it stops the child and relaunches the new build with Muse Code's own
 //!   resume argv ([`muse::argv`]); a busy child is never stopped;
-//! - it relaunches a crashed child on its session, within a budget ([`supervise`]);
-//! - under aterm it holds the session through a proven contract 3 claim
-//!   (`muse-alab@<pid> contract=3 scope=relaunch,upgrade`, [`aterm`]), every act waiting on a
-//!   fresh read of aterm ([`link`]), and gets out of the way (Muse Code `exec`ed in its place)
-//!   wherever aterm does not prove that claim.
+//! - it relaunches a crashed child on its session after aterm's back-off ladder's pause, and
+//!   restarts it on the same session when aterm asks ([`supervise`]);
+//! - under aterm it holds the session through a claim of both its duties
+//!   (`muse-alab@<pid> scope=relaunch,upgrade`, at contract 4 or 3) made by the shared
+//!   aterm client `alab-wire` ([`aterm`]), every act waiting on a fresh read of aterm, and
+//!   gets out of the way (Muse Code `exec`ed in its place) wherever aterm refuses that claim;
+//! - it moves itself onto a newer build of the harness the same way: at the same safe point it
+//!   `execve`s the new image in its own process, the child and its episode carried across on an
+//!   inherited descriptor ([`adopt`]).
 
+pub mod adopt;
 pub mod aterm;
 pub mod child;
 pub mod env;
 pub mod gate;
 pub mod journal;
 pub mod json;
-pub mod link;
 pub mod muse;
 pub mod probe;
 pub mod procs;

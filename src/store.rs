@@ -417,19 +417,7 @@ fn checked(
         link: link.to_path_buf(),
         why,
     };
-    let canon = |p: &Path| fs::canonicalize(p).ok();
-    if dir.parent().and_then(canon) != canon(&layout.program_dir(program)) {
-        return Err(bad_link("points outside the program's store directory"));
-    }
-    if !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
-        return Err(bad_link("names a directory that is not a plain directory"));
-    }
-    let name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| bad_link("names no build"))?;
-    let id =
-        parse_build_id(name).ok_or_else(|| bad_link("names a directory that is not a build id"))?;
+    let id = located(layout, program, &dir, link)?;
     let version = Version::from_build_id(id).ok_or_else(|| bad_link("names no vendor build"))?;
     let record = dir.with_extension("vendor");
     let text = read_sidecar(&record, 64 * 1024).ok_or_else(|| StoreError::Record {
@@ -446,6 +434,43 @@ fn checked(
             why: "names another version than its build directory",
         });
     }
+    let exe = complete(&dir, cmd)?;
+    let env = read_sidecar(&dir.with_extension("shim-env"), 4 * 1024)
+        .as_deref()
+        .map(parse_shim_env)
+        .unwrap_or_default();
+    Ok(Build {
+        version,
+        dir,
+        exe,
+        env,
+    })
+}
+
+/// The build id of `dir`, when it is a plain directory of `program`'s store named by a build
+/// id (`link` is what named it, for the error).
+fn located(layout: &Layout, program: &str, dir: &Path, link: &Path) -> Result<u64, StoreError> {
+    let bad_link = |why| StoreError::Link {
+        link: link.to_path_buf(),
+        why,
+    };
+    let canon = |p: &Path| fs::canonicalize(p).ok();
+    if dir.parent().and_then(canon) != canon(&layout.program_dir(program)) {
+        return Err(bad_link("points outside the program's store directory"));
+    }
+    if !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        return Err(bad_link("names a directory that is not a plain directory"));
+    }
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| bad_link("names no build"))?;
+    parse_build_id(name).ok_or_else(|| bad_link("names a directory that is not a build id"))
+}
+
+/// `<dir>/bin/<cmd>`, when the build's ready marker admits it on this platform and the binary
+/// is an executable regular file.
+fn complete(dir: &Path, cmd: &str) -> Result<PathBuf, StoreError> {
     let marker = dir.with_extension("ready");
     let running = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
     let ready = read_sidecar(&marker, 64 * 1024).is_some_and(|t| ready_text_accepts(&t, &running));
@@ -476,16 +501,48 @@ fn checked(
             why: "is not executable",
         });
     }
-    let env = read_sidecar(&dir.with_extension("shim-env"), 4 * 1024)
-        .as_deref()
-        .map(parse_shim_env)
-        .unwrap_or_default();
-    Ok(Build {
-        version,
-        dir,
-        exe,
-        env,
-    })
+    Ok(exe)
+}
+
+/// One installed build of the harness itself (a Plain program: no install record; atpkg
+/// orders its builds by build number, the dev commit's count).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnBuild {
+    /// Its store build number.
+    pub id: u64,
+    /// `<prefix>/store/<program>/<id>/bin/<cmd>`.
+    pub exe: PathBuf,
+}
+
+/// The harness program's current build, checked as [`current`] checks a vendor build but for
+/// the install record a Plain program does not have: the link names a build directory of this
+/// program in this store, its ready marker says `ok`, and `bin/<cmd>` is an executable regular
+/// file.
+///
+/// # Errors
+/// The first check that fails.
+pub fn own_current(layout: &Layout, program: &str, cmd: &str) -> Result<OwnBuild, StoreError> {
+    let link = layout.current_link(program);
+    let dir = current_target(layout, program)?;
+    let id = located(layout, program, &dir, &link)?;
+    let exe = complete(&dir, cmd)?;
+    Ok(OwnBuild { id, exe })
+}
+
+/// The build number of the harness image `me` (its canonical executable) when it is
+/// `<prefix>/store/<program>/<id>/bin/<cmd>` of this store; `None` for an image run from
+/// anywhere else (a checkout's target folder), which has no build to order a newer one against.
+#[must_use]
+pub fn own_build_of(layout: &Layout, program: &str, cmd: &str, me: &Path) -> Option<u64> {
+    if me.file_name().and_then(|n| n.to_str()) != Some(cmd) {
+        return None;
+    }
+    let bin = me.parent()?;
+    if bin.file_name().and_then(|n| n.to_str()) != Some("bin") {
+        return None;
+    }
+    let dir = bin.parent()?;
+    located(layout, program, dir, dir).ok()
 }
 
 /// Names a shim never sets (atpkg `shim_env.rs` `NEVER_SET`).
@@ -698,6 +755,62 @@ mod tests {
             "pending\nplatform=aarch64-macos\n",
             "aarch64-macos"
         ));
+    }
+
+    #[test]
+    fn the_harness_finds_its_own_builds_by_number() {
+        let root = std::env::temp_dir().join(format!("muse-alab-own-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let layout = Layout {
+            prefix: root.clone(),
+        };
+        let program = layout.program_dir("muse-alab");
+        for n in [1, 2] {
+            let bin = program.join(n.to_string()).join("bin");
+            fs::create_dir_all(&bin).expect("dir");
+            fs::write(bin.join("muse-alab"), b"#!/bin/sh\n").expect("binary");
+            fs::set_permissions(bin.join("muse-alab"), fs::Permissions::from_mode(0o755))
+                .expect("mode");
+            fs::write(program.join(format!("{n}.ready")), "ok\n").expect("ready");
+        }
+        std::os::unix::fs::symlink("2", program.join(CURRENT)).expect("current");
+        assert_eq!(
+            own_current(&layout, "muse-alab", "muse-alab"),
+            Ok(OwnBuild {
+                id: 2,
+                exe: program.join("2/bin/muse-alab"),
+            }),
+            "a Plain program's build has no install record"
+        );
+        let first = program.join("1/bin/muse-alab");
+        assert_eq!(
+            own_build_of(&layout, "muse-alab", "muse-alab", &first),
+            Some(1)
+        );
+        assert_eq!(
+            own_build_of(
+                &layout,
+                "muse-alab",
+                "muse-alab",
+                &root.join("target/debug/muse-alab")
+            ),
+            None,
+            "an image outside the store"
+        );
+        assert_eq!(
+            own_build_of(&layout, "muse-alab", "muse", &first),
+            None,
+            "another program's name"
+        );
+        fs::remove_file(program.join("2.ready")).expect("unready");
+        assert!(
+            matches!(
+                own_current(&layout, "muse-alab", "muse-alab"),
+                Err(StoreError::NotReady { .. })
+            ),
+            "an incomplete build"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

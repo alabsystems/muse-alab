@@ -14,32 +14,51 @@
 //!   with Muse Code's resume argv on the same session
 //!   ([`crate::muse::argv::rewrite_argv`]). A child that does not end within `stop_wait`
 //!   is left alone: never killed, never signalled again.
-//! - A child that crashed (aterm's Muse Code exit table: not clean, not a startup
-//!   refusal) is relaunched on its session the same way, at most `crash_budget` times per
-//!   `crash_window` (aterm's crash relaunch, `upgrade_muse_drive.rs` `after_exit_onto`),
-//!   on the newest build when it is proved to start, else on the build it ran. Under an
-//!   aterm claim the relaunch waits on aterm's word, held up to `reclaim_hold` while a claim
-//!   that lapsed is made again ([`Harness::relaunch_word`]).
+//! - A child that crashed (aterm's Muse Code exit table: not clean, not a startup refusal;
+//!   and abnormal by `alab_wire::relaunch::abnormal_exit`) is relaunched on its session the
+//!   same way after aterm's back-off ladder's pause (1 s, 10 s, 60 s, then 10 minutes; a
+//!   child that ran 10 minutes starts it over, [`alab_wire::relaunch::Ladder`]), on the
+//!   newest build when it is proved to start and the claim takes `upgrade`, else on the build
+//!   it ran. Under aterm the relaunch waits on aterm's word ([`Harness::crash_wait`]), up to
+//!   aterm's 45 s while aterm is away or answers only later; a `SIGINT`, `SIGQUIT`, `SIGHUP`
+//!   or `SIGTERM` meanwhile passes the crash on, and keys typed meanwhile are dropped. In a tab
+//!   where aterm never admitted a claim of this harness's, the crash is passed on at once.
+//! - A restart aterm asks the claim holder for (`restart cause=asked|stall`, a person's
+//!   `aterm ctl restart` or the stall's remedy) ends the child with `SIGTERM` (and `SIGKILL`
+//!   if it does not end, as aterm's own restart does) and resumes the same session, on the
+//!   model aterm names when it names one; it waits a bounded time for the session and for
+//!   aterm's word, and one meant for an earlier child is passed over ([`Harness::restarts`]).
+//!   A restart onto another account is refused: Muse Code takes no account home this
+//!   harness can set. Every child start re-announces the claim with the new child
+//!   ([`Harness::announce`]).
 //! - Any other end — a clean exit, a refusal, a crash it cannot resume, `SIGHUP` or
 //!   `SIGTERM` to the harness — ends the harness with the child's real status: the same
 //!   exit code, or death by the same signal.
+//! - It watches its own program's `current` too. When atpkg has installed a newer build of the
+//!   harness itself, it waits for the same safe point, proves the new image speaks its adoption
+//!   protocol, and `execve`s it in this process with the child and its episode carried across
+//!   ([`crate::adopt`], [`Harness::adopt`]): the same pid, the same child, never signalled.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use alab_wire::link::LATER_RETRY_MS;
+use alab_wire::relaunch::{AWAY_BUDGET, AwayBudget, ChildEnd, Ladder, abnormal_exit};
+use alab_wire::{Child, ChildProcess, Link, Relaunch, Restart};
+
+use crate::adopt::{self, Carried};
 use crate::child::{self, End, Status};
 use crate::env::{self, Env};
-use crate::gate::{self, Terminal, Timing};
+use crate::gate::{self, ComposerWitness, Terminal, Timing};
 use crate::journal::Journal;
-use crate::link::{Duty, Link};
 use crate::muse::{self, ExitKind, PACKAGE, PRODUCT, PROGRAM, argv, session};
 use crate::probe::{self, Probe};
-use crate::store::{self, Build, Layout};
+use crate::store::{self, Build, Layout, OwnBuild};
 use crate::tty::{self, Mode, Tty};
 use crate::version::{Version, moves_onto};
-use crate::{HARNESS, aterm, procs, say, signals};
+use crate::{HARNESS, HARNESS_VERSION, aterm, procs, say, signals};
 
 /// The loop's clocks and budgets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,19 +71,20 @@ pub struct Config {
     pub look_every: Duration,
     /// How often a missing session witness is searched for again.
     pub scan_every: Duration,
-    /// How long a child gets to end after the harness's `SIGTERM`.
+    /// How long a child gets to end after a move's `SIGTERM`.
     pub stop_wait: Duration,
-    /// How many crash relaunches a window allows.
-    pub crash_budget: usize,
-    /// The crash window.
-    pub crash_window: Duration,
+    /// How long a child gets to end after a restart's `SIGTERM` before its `SIGKILL` (a stalled
+    /// one gets at most [`STALL_KILL_AFTER`]), and after that `SIGKILL` before the restart is
+    /// abandoned.
+    pub term_grace: Duration,
     /// How long a build probe may run ([`crate::probe`]).
     pub probe_wait: Duration,
     /// How long after a failed probe the same build is probed again.
     pub probe_gap: Duration,
-    /// How long a crash relaunch waits for aterm to prove this harness's claim again after it
-    /// lapsed ([`Harness::relaunch_word`]).
-    pub reclaim_hold: Duration,
+    /// How long one crash relaunch waits in all for aterm to answer again
+    /// ([`AwayBudget`]), and how long a restart aterm asked for waits from its arrival for the
+    /// session and aterm's word ([`Deferred`]): aterm's 45 s.
+    pub away_budget: Duration,
 }
 
 impl Config {
@@ -75,19 +95,19 @@ impl Config {
         look_every: Duration::from_secs(2),
         scan_every: Duration::from_secs(30),
         stop_wait: Duration::from_secs(15),
-        crash_budget: 3,
-        crash_window: Duration::from_secs(600),
+        // aterm's restart act's deadline (`restart_act.rs`).
+        term_grace: Duration::from_secs(30),
         probe_wait: probe::PROBE_WAIT,
         probe_gap: probe::PROBE_GAP,
-        // aterm's adopted-claim grace: two of its 20 s claim renewals and 5 s, the time aterm
-        // itself gives a claimant to come back after a seamless update or a restart.
-        reclaim_hold: Duration::from_secs(45),
+        // aterm's grace for a claim whose connection went away (`harness_host.rs`).
+        away_budget: AWAY_BUDGET,
     };
 
     /// The clocks this build runs with: production, except that a DEBUG build reads
-    /// `MUSE_ALAB_TEST_TIMING=<tick>,<look>,<person grace>,<settle>,<stop wait>[,<reclaim
-    /// hold>]` (ms) so the integration tests run in seconds. A release build reads no such
-    /// variable.
+    /// `MUSE_ALAB_TEST_TIMING=<tick>,<look>,<person grace>,<settle>,<stop wait>[,<away
+    /// budget>]` (ms) so the integration tests run in seconds; the stop wait is a restart's
+    /// term grace too. A release build reads no such variable, and the crash ladder's pauses
+    /// are aterm's in every build.
     #[must_use]
     pub fn for_this_build() -> Self {
         #[cfg(debug_assertions)]
@@ -107,10 +127,10 @@ impl Config {
             .split(',')
             .map(|p| p.trim().parse().ok())
             .collect::<Option<_>>()?;
-        let (tick, look, grace, settle, stop, hold) = match ms.as_slice() {
+        let (tick, look, grace, settle, stop, away) = match ms.as_slice() {
             [tick, look, grace, settle, stop] => (tick, look, grace, settle, stop, None),
-            [tick, look, grace, settle, stop, hold] => {
-                (tick, look, grace, settle, stop, Some(*hold))
+            [tick, look, grace, settle, stop, away] => {
+                (tick, look, grace, settle, stop, Some(*away))
             }
             _ => return None,
         };
@@ -123,7 +143,8 @@ impl Config {
             look_every: Duration::from_millis(*look),
             scan_every: Duration::from_millis(*look),
             stop_wait: Duration::from_millis(*stop),
-            reclaim_hold: hold.map_or(Self::PRODUCTION.reclaim_hold, Duration::from_millis),
+            term_grace: Duration::from_millis(*stop),
+            away_budget: away.map_or(Self::PRODUCTION.away_budget, Duration::from_millis),
             ..Self::PRODUCTION
         })
     }
@@ -133,11 +154,22 @@ impl Config {
 /// failing to start the resumed session (falling back onto the previous build).
 const STARTUP_GRACE: Duration = Duration::from_secs(15);
 
+/// aterm's grace before a stalled program's `SIGKILL` (`crates/aterm-gui/src/input_stall.rs`
+/// `RESTART_GRACE`): a stalled program reads nothing, so it may never act on `SIGTERM`.
+const STALL_KILL_AFTER: Duration = Duration::from_secs(5);
+
+/// How soon aterm is asked again about a crash or an asked restart while it could not answer.
+const ASK_AGAIN: Duration = Duration::from_millis(LATER_RETRY_MS);
+
 /// The running child.
 #[derive(Debug)]
 struct Run {
     pid: u32,
     build: Build,
+    /// Its build as the claim's `vendor=` names it.
+    vendor: String,
+    /// Its kernel start, as the claim's `child=` names it (`None`: unreadable).
+    process: Option<ChildProcess>,
     /// Its arguments, without `argv[0]`.
     args: Vec<OsString>,
     /// When it was started (ms since the epoch, read just before the spawn).
@@ -154,12 +186,79 @@ struct Run {
     term_ignored: bool,
 }
 
+impl Run {
+    /// What the claim says about this child.
+    fn claim(&self) -> Child<'_> {
+        aterm::child(Some(&self.vendor), self.process)
+    }
+}
+
 #[derive(Debug)]
 struct Stop {
     from: Build,
     to: Build,
     session: String,
+    /// When the last signal was sent, on a clock that stops while the machine sleeps (std's
+    /// `Instant` on macOS). Time the child spends stopped does not count either: a stopped child
+    /// acts on no signal but `SIGKILL`, so [`Harness::continued`] starts the wait again whenever
+    /// the child is continued.
     sent: Instant,
+    /// For a restart aterm asked for (not a move), how it goes on.
+    restart: Option<Escalation>,
+}
+
+/// A restart aterm asked for, under way: made whatever the child does with its `SIGTERM`, as
+/// aterm's own restart act sends `SIGKILL` to a program still running after its grace
+/// (`crates/aterm-gui/src/restart_act.rs` `escalate`), which under this harness's `relaunch`
+/// claim aterm leaves to the holder. A move's `SIGTERM` is never followed by one: a child
+/// that ignores it runs on.
+#[derive(Debug)]
+struct Escalation {
+    /// aterm's cause.
+    cause: String,
+    /// The resume arguments, on aterm's model when it named one.
+    args: Vec<String>,
+    /// How long after the `SIGTERM` the `SIGKILL` follows.
+    kill_after: Duration,
+    /// Whether the `SIGKILL` was sent.
+    killed: bool,
+}
+
+impl Stop {
+    /// How long after [`Stop::sent`] the child must have ended.
+    fn limit(&self, cfg: &Config) -> Duration {
+        match &self.restart {
+            None => cfg.stop_wait,
+            Some(escalation) if !escalation.killed => escalation.kill_after,
+            Some(_) => cfg.term_grace,
+        }
+    }
+}
+
+/// A restart aterm asked for that waits: for the child's session, or for aterm to answer. It
+/// waits at most [`Config::away_budget`] from its arrival, whatever it waits for: a restart is
+/// made for the moment aterm asked in, and one made much later would end the child mid-turn
+/// for a cause long gone. aterm asks again while its cause stands (a stall's remedy fires
+/// again).
+#[derive(Debug)]
+struct Deferred {
+    event: Restart,
+    /// When it is refused if it still waits.
+    expires: Instant,
+    /// When aterm is asked again.
+    next_ask: Instant,
+    /// Why it waits, journalled once.
+    why: String,
+}
+
+/// What a restart aterm asked for came to.
+enum Asked {
+    /// The child was sent `SIGTERM`; the restart is under way.
+    Made,
+    /// It was refused, and journalled.
+    Refused,
+    /// It waits, and why.
+    Waits(String),
 }
 
 /// What the harness knows of whether one build starts ([`crate::probe`]).
@@ -184,14 +283,25 @@ pub struct Harness {
     /// next one would take raw mode for the mode to restore at its exit).
     mode: Option<Mode>,
     me: Option<PathBuf>,
-    crashes: Vec<Instant>,
+    /// aterm's crash back-off ([`Ladder`]), on [`aterm::now_ms`].
+    ladder: Ladder,
     /// This harness's nesting depth ([`crate::env::nesting_depth`]); every process it
     /// starts as the vendor carries `depth + 1`.
     depth: u32,
     /// The builds probed, and what was found.
     proofs: BTreeMap<Version, Proof>,
-    /// The harness's standing with aterm ([`crate::link`]): every act waits on its word.
+    /// The harness's link to aterm (`alab-wire`): every act under a claim waits on its word.
     link: Link,
+    /// This process runs in an aterm tab ([`aterm::hosted`]).
+    hosted: bool,
+    /// A restart aterm asked for that waits ([`Harness::restarts`]).
+    deferred: Option<Deferred>,
+    /// The store build this image is ([`store::own_build_of`]); `None` outside the store.
+    own: Option<u64>,
+    /// The last probe of a newer build of the harness itself, by build number.
+    own_proof: Option<(u64, Proof)>,
+    /// The last word the look at the harness's own update said.
+    own_word: String,
 }
 
 /// Whether `exe` is this harness, never to be run: named like it, the same file (a
@@ -287,6 +397,14 @@ fn describe(end: End) -> String {
     }
 }
 
+/// `end` as `alab-wire` judges an exit.
+fn child_end(end: End) -> ChildEnd {
+    match end {
+        End::Code(c) => ChildEnd::Exited(c),
+        End::Signal(s) => ChildEnd::Signaled(s),
+    }
+}
+
 impl Harness {
     /// A harness over `layout`, nested `depth` deep.
     #[must_use]
@@ -296,6 +414,11 @@ impl Harness {
             .ok()
             .and_then(|p| std::fs::canonicalize(p).ok());
         let tty = Tty::find();
+        let own = me
+            .as_deref()
+            .and_then(|me| store::own_build_of(&layout, HARNESS, HARNESS, me));
+        let config = aterm::config();
+        let hosted = aterm::hosted(&env, &config);
         Self {
             env,
             layout,
@@ -304,10 +427,15 @@ impl Harness {
             mode: tty.and_then(Tty::mode),
             tty,
             me,
-            crashes: Vec::new(),
+            ladder: Ladder::new(),
             depth,
             proofs: BTreeMap::new(),
-            link: Link::Off,
+            link: Link::absent(config, std::process::id()),
+            hosted,
+            deferred: None,
+            own,
+            own_proof: None,
+            own_word: String::new(),
         }
     }
 
@@ -371,14 +499,18 @@ impl Harness {
     }
 
     /// The build a relaunch starts: the newest one when it is `known` (the build proved
-    /// for the update, or the build the crashed child ran) or is proved to start now;
-    /// else `known` itself (or `fallback` when `known` is gone), looked at again, while
-    /// the store still holds it.
+    /// for the update, or the build the crashed child ran) or is proved to start now and the
+    /// claim takes `upgrade` ([`aterm::upgrade_granted`]: a newer build is a move); else
+    /// `known` itself (or `fallback` when `known` is gone), looked at again, while the store
+    /// still holds it.
     fn relaunch_build(&mut self, known: &Build, fallback: &Build) -> Result<Build, String> {
         let newest = self.vendor();
+        let may_move = aterm::upgrade_granted(&self.link, self.hosted);
         if let Ok(newest) = &newest
             && (newest.version == known.version
-                || (moves_onto(fallback.version, newest.version) && self.prove(newest).0))
+                || (may_move
+                    && moves_onto(fallback.version, newest.version)
+                    && self.prove(newest).0))
         {
             return Ok(newest.clone());
         }
@@ -405,6 +537,11 @@ impl Harness {
             }
         };
         let why = match &newest {
+            Ok(n) if !may_move && moves_onto(fallback.version, n.version) => format!(
+                "aterm's claim does not take upgrade (scope={}), so the newest build {} waits",
+                aterm::granted(&self.link),
+                n.version
+            ),
             Ok(n) => format!("the newest build {} is not proved to start", n.version),
             Err(e) => e.clone(),
         };
@@ -474,6 +611,8 @@ impl Harness {
         );
         Ok(Run {
             pid,
+            vendor: build.version.to_string(),
+            process: aterm::process_of(pid),
             build,
             args,
             started_ms,
@@ -491,22 +630,115 @@ impl Harness {
     }
 
     /// Run `first` with `args` and supervise it until the session really ends, under `link`'s
-    /// word (a proven aterm claim, or none outside aterm).
+    /// word (an aterm claim, held or being made, or none outside aterm). The first start
+    /// re-announces the claim with the child it now names ([`Harness::announce`]).
     pub fn run(mut self, first: Build, args: Vec<OsString>, link: Link) -> ! {
         self.link = link;
         let signals = match signals::install() {
             Ok(s) => s,
             Err(e) => self.fatal(70, &format!("cannot install its signal handlers: {e}")),
         };
-        let mut run = match self.start(first, args) {
+        let run = match self.start(first, args) {
             Ok(r) => r,
             Err(e) => self.fatal(126, &e),
         };
+        self.announce(&run);
+        self.supervise(&signals, run, signals::Pending::default())
+    }
+
+    /// THE NEW IMAGE after the harness's own re-exec ([`crate::adopt`]): take over the child the
+    /// old image ran, with its episode, and supervise it as the old image would have; the
+    /// signals posted across the exec are acted on first, and a claim the old image held is made
+    /// again at once under this image's version.
+    pub fn adopt(mut self, carried: Carried) -> ! {
+        let signals = match signals::install() {
+            Ok(s) => s,
+            Err(e) => self.fatal(70, &format!("cannot install its signal handlers: {e}")),
+        };
+        let arrived = signals::take_blocked();
+        let now = Instant::now();
+        let ago = |age: Duration| now.checked_sub(age).unwrap_or(now);
+        if carried.mode.is_some() {
+            self.mode = carried.mode;
+        }
+        let (streak, since) = carried.ladder;
+        self.ladder = Ladder::carried(streak, since, aterm::now_ms());
+        self.proofs = carried
+            .proofs
+            .iter()
+            .map(|(v, found, age, blind)| {
+                (
+                    *v,
+                    Proof {
+                        found: *found,
+                        at: ago(*age),
+                        blind: *blind,
+                    },
+                )
+            })
+            .collect();
+        let run = Run {
+            pid: carried.child,
+            vendor: carried.build.version.to_string(),
+            process: aterm::process_of(carried.child),
+            build: carried.build,
+            args: carried.args,
+            started_ms: carried.started_ms,
+            lock: carried.lock,
+            scanned: None,
+            stop: None,
+            moved: carried
+                .moved
+                .map(|(prev, session, age)| (prev, session, ago(age))),
+            term_ignored: carried.term_ignored,
+        };
+        self.journal.note(
+            "ADOPTED",
+            &format!(
+                "{HARNESS} {HARNESS_VERSION} (build {}) took over child={} {PROGRAM}={} from {HARNESS} {}",
+                self.own.map_or_else(|| "-".to_string(), |n| n.to_string()),
+                run.pid,
+                run.build.version,
+                carried.from
+            ),
+        );
+        // The old image's claim ended with its connections at the exec, its duty towards the
+        // child did not: claimed again at once under this image's version, with the child.
+        let config = aterm::config();
+        self.link = if carried.linked {
+            Link::adopt_with(
+                config,
+                std::process::id(),
+                run.claim(),
+                aterm::now_ms(),
+                aterm::lookup(&self.env),
+            )
+        } else {
+            Link::absent(config, std::process::id())
+        };
+        aterm::journal(&mut self.link, &self.journal);
+        self.supervise(&signals, run, arrived)
+    }
+
+    /// THE LOOP over `run` until the session ends, `arrived` acted on first.
+    fn supervise(
+        mut self,
+        signals: &signals::Signals,
+        mut run: Run,
+        arrived: signals::Pending,
+    ) -> ! {
         let mut ending: Option<libc::c_int> = None;
         let mut last_look: Option<Instant> = None;
         let mut last_word = String::new();
+        let mut carried = arrived;
         loop {
-            let p = signals.wait(self.cfg.tick);
+            let p = if carried == signals::Pending::default() {
+                signals.wait(self.cfg.tick)
+            } else {
+                signals
+                    .wait(Duration::ZERO)
+                    .or(std::mem::take(&mut carried))
+            };
             if p.hup {
                 ending.get_or_insert(libc::SIGHUP);
                 signals::send(run.pid, libc::SIGHUP);
@@ -519,6 +751,9 @@ impl Harness {
                 self.journal
                     .note("SIGNAL", "SIGTERM passed on; the session is ending");
             }
+            // The harness continued (after it followed the child's stop, or a whole-job `^Z`
+            // stopped both): it continues the child too.
+            let mut continued = p.cont;
             if p.cont {
                 signals::send(run.pid, libc::SIGCONT);
             }
@@ -532,9 +767,12 @@ impl Harness {
                             signals::stop_self(sig);
                         }
                     }
-                    Ok(Some(Status::Continued)) => {}
+                    // A continue the harness may never have seen a stop for: a whole-job `^Z`
+                    // and the shell's `fg` stop and continue both, and only the continue is
+                    // reported once the harness runs again.
+                    Ok(Some(Status::Continued)) => continued = true,
                     Ok(Some(Status::Ended(end))) => {
-                        run = self.after_end(run, end, ending, &signals);
+                        run = self.after_end(run, end, ending, p.int, signals);
                         last_look = None;
                         last_word.clear();
                         break;
@@ -542,9 +780,45 @@ impl Harness {
                     Err(e) => self.fatal(70, &format!("lost its child {}: {e}", run.pid)),
                 }
             }
+            if continued {
+                self.continued(&mut run);
+            }
+            // A child still stopped is not judged: the harness continued alone after following
+            // its stop (`kill -CONT` on the harness's pid) has spent the stop on the clock, and
+            // continues the child on its next pass, which starts the wait again.
             if let Some(stop) = &run.stop
-                && stop.sent.elapsed() >= self.cfg.stop_wait
+                && stop.sent.elapsed() >= stop.limit(&self.cfg)
+                && procs::is_stopped(run.pid) != Some(true)
             {
+                self.unhonoured(&mut run);
+            }
+            let now = aterm::now_ms();
+            self.link.tick(run.claim(), now);
+            let drained = self.link.events(run.claim(), now);
+            aterm::journal(&mut self.link, &self.journal);
+            self.restarts(&mut run, drained.restart, ending);
+            if ending.is_none()
+                && run.stop.is_none()
+                && self.deferred.is_none()
+                && last_look.is_none_or(|t| t.elapsed() >= self.cfg.look_every)
+            {
+                last_look = Some(Instant::now());
+                if let Some(own) = self.look(&mut run, &mut last_word) {
+                    carried = self.reexec(&run, &own, signals);
+                }
+            }
+        }
+    }
+
+    /// The child did not end within its stop's limit. A move's child runs on, never signalled
+    /// again; a restart's gets `SIGKILL`, and the restart is abandoned if even that does not end
+    /// it.
+    fn unhonoured(&self, run: &mut Run) {
+        let Some(stop) = run.stop.as_mut() else {
+            return;
+        };
+        match stop.restart.as_mut() {
+            None => {
                 self.journal.note(
                     "STOP-UNHONOURED",
                     &format!(
@@ -555,41 +829,281 @@ impl Harness {
                 run.stop = None;
                 run.term_ignored = true;
             }
-            self.link
-                .tick(&run.build.version.to_string(), &self.journal);
-            if ending.is_none()
-                && run.stop.is_none()
-                && !run.term_ignored
-                && last_look.is_none_or(|t| t.elapsed() >= self.cfg.look_every)
-            {
-                last_look = Some(Instant::now());
-                self.look(&mut run, &mut last_word);
+            Some(escalation) if !escalation.killed => {
+                self.journal.note(
+                    "RESTART-KILL",
+                    &format!(
+                        "cause={} child={} did not end within {} ms of SIGTERM; SIGKILL",
+                        escalation.cause,
+                        run.pid,
+                        escalation.kill_after.as_millis()
+                    ),
+                );
+                signals::send(run.pid, libc::SIGKILL);
+                escalation.killed = true;
+                stop.sent = Instant::now();
+            }
+            Some(escalation) => {
+                self.journal.note(
+                    "RESTART-ABANDONED",
+                    &format!(
+                        "cause={} child={} still runs {} ms after SIGKILL",
+                        escalation.cause,
+                        run.pid,
+                        self.cfg.term_grace.as_millis()
+                    ),
+                );
+                run.stop = None;
             }
         }
     }
 
-    /// One look: a newer build installed, the safe point reached and the new build proved
-    /// to start, stops the child.
-    fn look(&mut self, run: &mut Run, last_word: &mut String) {
-        let Ok(target) = self.vendor() else {
+    /// THE RESTARTS aterm asks for, on every pass of the loop while a child runs: a new request
+    /// (`asked`, drained from aterm's event stream) replaces one still waiting, and the one
+    /// waiting is tried when it is due ([`Harness::restart_now`]), each at most
+    /// [`Config::away_budget`] after it arrived. While the session ends or the child is already
+    /// being ended, a new request is passed over: aterm sent it for this child, which is going.
+    fn restarts(&mut self, run: &mut Run, asked: Option<Restart>, ending: Option<libc::c_int>) {
+        let now = Instant::now();
+        let busy = ending.is_some() || run.stop.is_some();
+        if let Some(event) = asked {
+            if busy {
+                self.journal.note(
+                    "RESTART-PASSED-OVER",
+                    &format!("cause={} the child is already being ended", event.cause),
+                );
+            } else if let Some(old) = self.deferred.replace(Deferred {
+                event,
+                expires: now + self.cfg.away_budget,
+                next_ask: now,
+                why: String::new(),
+            }) {
+                self.journal.note(
+                    "RESTART-PASSED-OVER",
+                    &format!("cause={} a newer restart replaced it", old.event.cause),
+                );
+            }
+        }
+        if busy {
+            return;
+        }
+        let Some(mut waiting) = self.deferred.take() else {
             return;
         };
-        if !moves_onto(run.build.version, target.version) {
+        // Its limit is judged before aterm is asked again, so a pass that comes late (the job
+        // stopped with `^Z`, which `Instant` counts) refuses it rather than make it then.
+        if now >= waiting.expires {
+            self.journal.note(
+                "RESTART-REFUSED",
+                &format!(
+                    "cause={} not made within {} ms: {}",
+                    waiting.event.cause,
+                    self.cfg.away_budget.as_millis(),
+                    waiting.why
+                ),
+            );
             return;
+        }
+        if now < waiting.next_ask {
+            self.deferred = Some(waiting);
+            return;
+        }
+        match self.restart_now(run, &waiting.event) {
+            Asked::Made | Asked::Refused => {}
+            Asked::Waits(why) => {
+                if waiting.why != why {
+                    self.journal.note(
+                        "RESTART-WAITS",
+                        &format!("cause={} {why}", waiting.event.cause),
+                    );
+                    waiting.why = why;
+                }
+                waiting.next_ask = now + ASK_AGAIN;
+                self.deferred = Some(waiting);
+            }
+        }
+    }
+
+    /// aterm asked the claim holder to restart its child (`restart cause=<cause>`): end the
+    /// child with `SIGTERM` now (and `SIGKILL` if it does not end, [`Escalation`]), and resume
+    /// the same session when it has ended. The request is aterm's, or a person's through aterm,
+    /// so no safe point is waited for, and it is no crash: the ladder is not touched.
+    ///
+    /// It is made only when the child's session is witnessed, the resume argv can be written
+    /// (on the model aterm names, Muse Code's `--model`), the restart moves no account (Muse
+    /// Code takes no account home this harness can set: refused, and the child runs on), and
+    /// one fresh policy and status read permits it (`Link::relaunch_word` with `asked`: the
+    /// claim is this harness's, proven and takes `relaunch`, and nobody holds the session). A
+    /// request with no session yet, or one aterm could not answer, waits.
+    fn restart_now(&mut self, run: &mut Run, event: &Restart) -> Asked {
+        let cause = &event.cause;
+        if let Some(account) = &event.account {
+            self.journal.note(
+                "RESTART-REFUSED",
+                &format!(
+                    "cause={cause} to={}: {PRODUCT} takes no account home {HARNESS} can set; the child runs on",
+                    account.label
+                ),
+            );
+            return Asked::Refused;
+        }
+        let Some((session, _)) = self.witness(run) else {
+            return Asked::Waits("no session lock names the child's session yet".to_string());
+        };
+        let resume = grammar_argv(&run.build, &run.args)
+            .ok_or_else(|| "its launch has an argument that is not UTF-8".to_string())
+            .and_then(|launch| {
+                argv::rewrite_argv(&launch, Some(&session))
+                    .map_err(|e| format!("its launch cannot be resumed ({e})"))
+            })
+            .and_then(|args| match &event.model {
+                Some(model) => argv::with_model(&args, model)
+                    .map_err(|e| format!("model={model} cannot be named ({e})")),
+                None => Ok(args),
+            });
+        let args = match resume {
+            Ok(args) => args,
+            Err(why) => {
+                self.journal
+                    .note("RESTART-REFUSED", &format!("cause={cause} {why}"));
+                return Asked::Refused;
+            }
+        };
+        let word = self.link.relaunch_word(true, aterm::now_ms());
+        aterm::journal(&mut self.link, &self.journal);
+        match word {
+            Relaunch::Permitted => {}
+            Relaunch::Denied(why) => {
+                self.journal
+                    .note("RESTART-REFUSED", &format!("cause={cause} {why}"));
+                return Asked::Refused;
+            }
+            Relaunch::Away(why) | Relaunch::Later(why) => {
+                return Asked::Waits(format!("aterm did not answer: {why}"));
+            }
+        }
+        if !signals::send(run.pid, libc::SIGTERM) {
+            self.journal.note(
+                "RESTART-REFUSED",
+                &format!("cause={cause} child={} took no SIGTERM", run.pid),
+            );
+            return Asked::Refused;
+        }
+        let model = event
+            .model
+            .as_ref()
+            .map_or_else(String::new, |m| format!(" model={m}"));
+        self.journal.note(
+            "RESTART",
+            &format!(
+                "cause={cause}{model}: child={} SIGTERM, resuming session {session}",
+                run.pid
+            ),
+        );
+        let kill_after = if cause == "stall" {
+            STALL_KILL_AFTER.min(self.cfg.term_grace)
+        } else {
+            self.cfg.term_grace
+        };
+        run.stop = Some(Stop {
+            from: run.build.clone(),
+            to: run.build.clone(),
+            session,
+            sent: Instant::now(),
+            restart: Some(Escalation {
+                cause: cause.clone(),
+                args,
+                kill_after,
+                killed: false,
+            }),
+        });
+        Asked::Made
+    }
+
+    /// A child was started: a restart aterm asked for until now was meant for the child before
+    /// it, so it is passed over and never applied to this one (one still waiting, and one aterm
+    /// sent as that child ended and not yet drained); then the claim is announced again with
+    /// the new child (`vendor=`, and `child=<pid>:<start>` under contract 4).
+    fn announce(&mut self, run: &Run) {
+        if let Some(waiting) = self.deferred.take() {
+            self.journal.note(
+                "RESTART-PASSED-OVER",
+                &format!(
+                    "cause={} it waited for the child before this one",
+                    waiting.event.cause
+                ),
+            );
+        }
+        let now = aterm::now_ms();
+        self.link.tick(run.claim(), now);
+        let drained = self.link.events(run.claim(), now);
+        aterm::journal(&mut self.link, &self.journal);
+        if let Some(event) = drained.restart {
+            self.journal.note(
+                "RESTART-PASSED-OVER",
+                &format!(
+                    "cause={} it came before this child was announced",
+                    event.cause
+                ),
+            );
+        }
+        self.link.reannounce(run.claim(), aterm::now_ms());
+        aterm::journal(&mut self.link, &self.journal);
+    }
+
+    /// TIME STOPPED IS NOT GRACE: the child was continued, so the wait of a `SIGTERM` the harness
+    /// sent starts again (a stopped child could not act on it).
+    fn continued(&self, run: &mut Run) {
+        if let Some(stop) = run.stop.as_mut() {
+            stop.sent = Instant::now();
+            self.journal.note(
+                "CONTINUED",
+                &format!(
+                    "child={} was continued; the {:?} it has to end after SIGTERM starts again",
+                    run.pid, self.cfg.stop_wait
+                ),
+            );
+        }
+    }
+
+    /// One look: a vendor move when a newer vendor build is installed (and the child was never
+    /// found to outlive a `SIGTERM`), else the harness's own update, which this returns when it
+    /// may go ahead now.
+    fn look(&mut self, run: &mut Run, last_word: &mut String) -> Option<OwnBuild> {
+        if !run.term_ignored && self.vendor_look(run, last_word) {
+            return None;
+        }
+        self.own_look(run)
+    }
+
+    /// The vendor's look: a newer build installed, the safe point reached and the new build
+    /// proved to start, stops the child. Whether a vendor move holds this look: a newer build
+    /// is installed and the move waits on anything but its own build's probe (a build that does
+    /// not start leaves the look to the harness's own update).
+    fn vendor_look(&mut self, run: &mut Run, last_word: &mut String) -> bool {
+        let Ok(target) = self.vendor() else {
+            return false;
+        };
+        if !moves_onto(run.build.version, target.version) {
+            return false;
         }
         let failed_lately = self.proofs.get(&target.version).is_some_and(|p| {
             p.found != Probe::Starts && (p.blind || p.at.elapsed() < self.cfg.probe_gap)
         });
-        // A build whose probe failed lately holds before the safe point is read at all.
-        let checked = if failed_lately {
+        let mut detail = None;
+        // A claim that does not hand this harness the move, and a build whose probe failed
+        // lately, hold before the safe point is read at all.
+        let checked = if let Err((word, why)) = aterm::upgrade_held(&self.link, self.hosted) {
+            detail = Some(why);
+            Err(word)
+        } else if failed_lately {
             Err("build-unproved")
         } else {
             self.safe_point(run)
         };
-        let mut detail = None;
         let word = match checked {
             Err(word) => word,
-            Ok((session, terminal)) => match self.prove(&target) {
+            Ok((session, terminal, submitted_us)) => match self.prove(&target) {
                 (false, _) => "build-unproved",
                 // Proved just now: the probe took time, so the next look reads the whole
                 // safe point again before any signal.
@@ -598,14 +1112,13 @@ impl Harness {
                     // The last re-check, just before the signal: no input since the look,
                     // still the foreground, still no tool running.
                     let now = self.terminal();
-                    let grace = self.grace();
-                    let vendor = run.build.version.to_string();
+                    let composer = ComposerWitness::InputClock {
+                        last_input_us: terminal.last_input_us,
+                        submitted_us,
+                    };
                     if now != Some(terminal) || procs::descendants(run.pid) != Some(0) {
                         "changed-before-signal"
-                    } else if let Err((word, why)) =
-                        self.link
-                            .may_act(Duty::Upgrade, grace, &vendor, &self.journal)
-                    {
+                    } else if let Err((word, why)) = self.move_unheld(composer) {
                         detail = Some(why);
                         word
                     } else if signals::send(run.pid, libc::SIGTERM) {
@@ -621,8 +1134,9 @@ impl Harness {
                             to: target,
                             session,
                             sent: Instant::now(),
+                            restart: None,
                         });
-                        return;
+                        return true;
                     } else {
                         "signal-refused"
                     }
@@ -642,6 +1156,196 @@ impl Harness {
             );
             *last_word = word.to_string();
         }
+        word != "build-unproved"
+    }
+
+    /// The harness's own look ([`crate::adopt`]): a newer build of the harness in the store, the
+    /// same safe point as a move's, and the new image proved to speak this one's adoption
+    /// protocol; then the build to re-exec into. Each new word that holds it is journalled once.
+    fn own_look(&mut self, run: &mut Run) -> Option<OwnBuild> {
+        let running = self.own?;
+        let target = store::own_current(&self.layout, HARNESS, HARNESS).ok()?;
+        if target.id <= running {
+            return None;
+        }
+        let failed_lately = self.own_proof.is_some_and(|(id, p)| {
+            id == target.id
+                && p.found != Probe::Starts
+                && (p.blind || p.at.elapsed() < self.cfg.probe_gap)
+        });
+        let mut detail = None;
+        let checked = if let Err((word, why)) = aterm::upgrade_held(&self.link, self.hosted) {
+            detail = Some(why);
+            Err(word)
+        } else if failed_lately {
+            Err("build-unproved")
+        } else {
+            self.safe_point(run)
+        };
+        let word = match checked {
+            Err(word) => word,
+            Ok((_, terminal, submitted_us)) => match self.prove_own(&target) {
+                (false, _) => "build-unproved",
+                (true, true) => "build-proved",
+                (true, false) => {
+                    let composer = ComposerWitness::InputClock {
+                        last_input_us: terminal.last_input_us,
+                        submitted_us,
+                    };
+                    if self.terminal() != Some(terminal) || procs::descendants(run.pid) != Some(0) {
+                        "changed-before-exec"
+                    } else if let Err((word, why)) = self.move_unheld(composer) {
+                        detail = Some(why);
+                        word
+                    } else {
+                        return Some(target);
+                    }
+                }
+            },
+        };
+        if self.own_word != word {
+            self.journal.note(
+                "WAIT",
+                &format!(
+                    "{HARNESS} {HARNESS_VERSION} (build {running}) -> build {} waits: {word}{}",
+                    target.id,
+                    detail.map_or_else(String::new, |d| format!(" ({d})"))
+                ),
+            );
+            self.own_word = word.to_string();
+        }
+        None
+    }
+
+    /// Whether the harness's own build `target` is proved to speak this image's adoption
+    /// protocol ([`adopt::judge_probe`]): `(proved, probed_now)`, kept as [`Harness::prove`]
+    /// keeps a vendor build's.
+    fn prove_own(&mut self, target: &OwnBuild) -> (bool, bool) {
+        if let Some((id, p)) = &self.own_proof
+            && *id == target.id
+        {
+            if p.found == Probe::Starts {
+                return (true, false);
+            }
+            if p.blind || p.at.elapsed() < self.cfg.probe_gap {
+                return (false, false);
+            }
+        }
+        let (found, said) =
+            probe::said_within(&target.exe, adopt::PROBE_ARG, &[], self.cfg.probe_wait);
+        let found = adopt::judge_probe(found, &said);
+        self.journal.note(
+            "PROBE",
+            &format!(
+                "{HARNESS} build {}: `{} {}` {}",
+                target.id,
+                target.exe.display(),
+                adopt::PROBE_ARG,
+                found.word()
+            ),
+        );
+        self.own_proof = Some((
+            target.id,
+            Proof {
+                found,
+                at: Instant::now(),
+                blind: false,
+            },
+        ));
+        (found == Probe::Starts, true)
+    }
+
+    /// aterm's word at a move's act ([`aterm::move_unheld`]), its notes journalled.
+    fn move_unheld(&mut self, composer: ComposerWitness) -> Result<(), (&'static str, String)> {
+        let grace = self.grace();
+        let word = aterm::move_unheld(
+            &mut self.link,
+            self.hosted,
+            grace,
+            composer,
+            aterm::now_ms(),
+        );
+        aterm::journal(&mut self.link, &self.journal);
+        word
+    }
+
+    /// What crosses the re-exec ([`Carried`]).
+    fn carry(&self, run: &Run) -> Carried {
+        Carried {
+            from: HARNESS_VERSION.to_string(),
+            prefix: self.layout.prefix.clone(),
+            child: run.pid,
+            build: run.build.clone(),
+            args: run.args.clone(),
+            started_ms: run.started_ms,
+            lock: run.lock.clone(),
+            moved: run
+                .moved
+                .as_ref()
+                .map(|(prev, session, at)| (prev.clone(), session.clone(), at.elapsed())),
+            term_ignored: run.term_ignored,
+            ladder: (self.ladder.streak(), self.ladder.since(aterm::now_ms())),
+            proofs: self
+                .proofs
+                .iter()
+                .map(|(v, p)| (*v, p.found, p.at.elapsed(), p.blind))
+                .collect(),
+            mode: self.mode,
+            linked: !self.link.is_absent(),
+        }
+    }
+
+    /// RE-EXEC into the harness's own build `target` ([`crate::adopt`]), the caught signals
+    /// blocked across it. Returns only when it did not happen: with what arrived meanwhile when
+    /// a `SIGHUP`, `SIGTERM` or `SIGCONT` holds it (the loop acts on them first), else after the
+    /// exec failed, which leaves that build unproved for good.
+    fn reexec(
+        &mut self,
+        run: &Run,
+        target: &OwnBuild,
+        signals: &signals::Signals,
+    ) -> signals::Pending {
+        let running = self.own.map_or_else(|| "-".to_string(), |n| n.to_string());
+        if let Err(e) = signals::block_caught() {
+            self.journal
+                .note("NO-REEXEC", &format!("cannot block its signals: {e}"));
+            return signals::Pending::default();
+        }
+        let arrived = signals.wait(Duration::ZERO);
+        if arrived.acts() {
+            signals::unblock_caught();
+            self.journal.note(
+                "WAIT",
+                &format!(
+                    "{HARNESS} {HARNESS_VERSION} (build {running}) -> build {} waits: a signal arrived",
+                    target.id
+                ),
+            );
+            return arrived;
+        }
+        let carried = self.carry(run);
+        self.journal.note(
+            "REEXEC",
+            &format!(
+                "{HARNESS} {HARNESS_VERSION} (build {running}) -> build {} ({}): child={} and its session {} cross on a descriptor",
+                target.id,
+                target.exe.display(),
+                run.pid,
+                run.lock.as_ref().map_or("-", |(s, _)| s.as_str())
+            ),
+        );
+        let why = adopt::exec_into(&target.exe, &carried);
+        signals::unblock_caught();
+        self.journal.note("NO-REEXEC", &why);
+        self.own_proof = Some((
+            target.id,
+            Proof {
+                found: Probe::NoExec,
+                at: Instant::now(),
+                blind: true,
+            },
+        ));
+        arrived
     }
 
     fn terminal(&self) -> Option<Terminal> {
@@ -652,9 +1356,11 @@ impl Harness {
         })
     }
 
-    /// The safe point, read cheapest first ([`gate::gate`]'s order): the session and the
-    /// terminal reading it was decided on, or the hold.
-    fn safe_point(&self, run: &mut Run) -> Result<(String, Terminal), &'static str> {
+    /// The safe point, read cheapest first ([`gate::gate`]'s order): the session, the terminal
+    /// reading it was decided on and the last submission, or the hold. The composer is judged at
+    /// the act, on aterm's fresh word where aterm serves one, else on the input clock against
+    /// that submission ([`aterm::move_unheld`]).
+    fn safe_point(&self, run: &mut Run) -> Result<(String, Terminal, u64), &'static str> {
         let resumable = grammar_argv(&run.build, &run.args)
             .ok_or_else(|| "non-utf8".to_string())
             .and_then(|a| argv::rewrite_argv(&a, None).map_err(|e| e.to_string()))
@@ -671,8 +1377,8 @@ impl Harness {
         };
         let log = session::log_look(&lock, run.pid, run.started_ms);
         let terminal = terminal.ok_or("no-tty")?;
-        gate::check_log(&log, terminal.last_input_us, now, &self.cfg.timing)?;
-        Ok((session, terminal))
+        let submitted_us = gate::check_log(&log, now, &self.cfg.timing)?;
+        Ok((session, terminal, submitted_us))
     }
 
     /// The session the child holds: the cached lock while it still names the child, else
@@ -696,13 +1402,16 @@ impl Harness {
         run.lock.clone()
     }
 
-    /// The child ended: relaunch it, or end the harness as it ended. A crash relaunch may wait
-    /// on aterm's word ([`Harness::relaunch_word`]), watching `signals` meanwhile.
+    /// The child ended: relaunch it, or end the harness as it ended. A crash relaunch waits for
+    /// the ladder's pause and aterm's word ([`Harness::crash_wait`]), watching `signals`
+    /// meanwhile; `interrupted` says a `SIGINT` or `SIGQUIT` reached the harness in the pass
+    /// that found the end.
     fn after_end(
         &mut self,
         mut run: Run,
         end: End,
         ending: Option<libc::c_int>,
+        interrupted: bool,
         signals: &signals::Signals,
     ) -> Run {
         let kind = muse::exit_kind(end.shell_status());
@@ -717,15 +1426,28 @@ impl Harness {
             let prev = stop.from;
             let from = prev.version;
             let session = stop.session.clone();
-            let moved = match self.relaunch_plan(&run, &session, &stop.to, &run.build) {
-                Ok((build, args)) => {
+            let moved = match stop.restart {
+                // aterm's restart: the same session, on the build the child ran unless a newer
+                // one is proved and the claim takes `upgrade`.
+                Some(restart) => self.relaunch_build(&stop.to, &run.build).and_then(|build| {
                     let msg = format!(
-                        "moving {PRODUCT} {from} -> {}, resuming session {session}",
+                        "{PRODUCT} ended for aterm's restart (cause={}, {}); resuming session {session} on {}",
+                        restart.cause,
+                        describe(end),
                         build.version
                     );
-                    self.relaunch_start(build, &run.build, args, &msg)
-                }
-                Err(why) => Err(why),
+                    self.relaunch_start(build, &run.build, restart.args, &msg)
+                }),
+                None => match self.relaunch_plan(&run, &session, &stop.to, &run.build) {
+                    Ok((build, args)) => {
+                        let msg = format!(
+                            "moving {PRODUCT} {from} -> {}, resuming session {session}",
+                            build.version
+                        );
+                        self.relaunch_start(build, &run.build, args, &msg)
+                    }
+                    Err(why) => Err(why),
+                },
             };
             match moved {
                 Ok(mut next) => {
@@ -784,7 +1506,9 @@ impl Harness {
                 }
             }
         }
-        if kind != ExitKind::Crashed {
+        // A crash is an end both rules call abnormal: Muse Code's exit table (not clean, not a
+        // startup refusal) and aterm's (`abnormal_exit`: no job or terminal signal's).
+        if kind != ExitKind::Crashed || !abnormal_exit(child_end(end)) {
             self.finish(end);
         }
         run.scanned = None;
@@ -803,32 +1527,61 @@ impl Harness {
             );
             self.finish(end);
         }
-        let now = Instant::now();
-        let window = self.cfg.crash_window;
-        self.crashes.retain(|t| now.duration_since(*t) < window);
-        if self.crashes.len() >= self.cfg.crash_budget {
-            let why = format!(
-                "{PRODUCT} ended abnormally ({}) {} times within {} s; not relaunching it again",
-                describe(end),
-                self.crashes.len() + 1,
-                window.as_secs()
-            );
-            say(&format!("{HARNESS}: {why}"));
-            self.journal.note("NO-RELAUNCH", &why);
-            self.finish(end);
-        }
-        let vendor = run.build.version.to_string();
-        if let Err(why) = self.relaunch_word(signals, &vendor) {
-            self.journal.note("NO-RELAUNCH", &why);
-            self.finish(end);
-        }
-        let (ran, nth, budget) = (
-            run.build.version,
-            self.crashes.len() + 1,
-            self.cfg.crash_budget,
-        );
-        let secs = window.as_secs();
         let known = run.build.clone();
+        let resume = grammar_argv(&known, &run.args)
+            .ok_or_else(|| "its launch has an argument that is not UTF-8".to_string())
+            .and_then(|launch| {
+                argv::rewrite_argv(&launch, Some(&session))
+                    .map_err(|e| format!("its launch cannot be resumed ({e})"))
+            });
+        if let Err(why) = resume {
+            self.journal.note("NO-RELAUNCH", &why);
+            self.finish(end);
+        }
+        // In an aterm tab where this harness never held a claim (one aterm has not admitted yet,
+        // busy, off for now or not serving its contract, or refused for good), the crash is not
+        // this harness's to answer: aterm never let it lead the tab, and its answer stands now,
+        // not after a wait for a claim nobody lost.
+        if self.hosted && !self.link.claims() {
+            let why = if self.link.is_absent() {
+                "aterm refused this harness's claim for the session"
+            } else {
+                "aterm has not admitted this harness's claim"
+            };
+            self.journal
+                .note("NO-RELAUNCH", &format!("no-claim: {why}"));
+            self.finish(end);
+        }
+        // The crashed child left the terminal in its own mode: put the starting one back at once,
+        // so a key reaches the harness as a signal for as long as no child runs.
+        self.restore_mode();
+        if let Some(waiting) = self.deferred.take() {
+            self.journal.note(
+                "RESTART-REFUSED",
+                &format!("cause={} child-ended", waiting.event.cause),
+            );
+        }
+        let pause = self.ladder.crashed(aterm::now_ms());
+        self.journal.note(
+            "CRASH",
+            &format!(
+                "child={} {}: session {session} streak={} pause-ms={}",
+                run.pid,
+                describe(end),
+                self.ladder.streak(),
+                pause.as_millis()
+            ),
+        );
+        if let Err(why) = self.crash_wait(signals, pause, &run.vendor, interrupted) {
+            say(&format!(
+                "{HARNESS}: {PRODUCT} ended abnormally ({}); not relaunching it: {why}",
+                describe(end)
+            ));
+            self.journal.note("NO-RELAUNCH", &why);
+            self.discard_input();
+            self.finish(end);
+        }
+        let ran = run.build.version;
         let resumed = match self.relaunch_plan(&run, &session, &known, &run.build) {
             Ok((build, args)) => {
                 let on = build.version;
@@ -838,89 +1591,142 @@ impl Harness {
                     format!(" on {on}")
                 };
                 let msg = format!(
-                    "{PRODUCT} ended abnormally ({}); resuming session {session}{onto} (relaunch {nth} of {budget} within {secs} s)",
-                    describe(end)
+                    "{PRODUCT} ended abnormally ({}); resuming session {session}{onto} (crash relaunch {} after a {} ms pause)",
+                    describe(end),
+                    self.ladder.streak().saturating_add(1),
+                    pause.as_millis()
                 );
+                self.discard_input();
                 self.relaunch_start(build, &run.build, args, &msg)
             }
             Err(why) => Err(why),
         };
         match resumed {
             Ok(mut next) => {
+                self.ladder.relaunched(aterm::now_ms());
                 if next.build.version != ran {
                     next.moved = Some((known, session, Instant::now()));
                 }
-                self.crashes.push(now);
                 next
             }
             Err(why) => {
                 say(&format!("{HARNESS}: {PRODUCT} cannot be resumed: {why}"));
                 self.journal.note("NO-RELAUNCH", &why);
+                self.discard_input();
                 self.finish(end);
             }
         }
     }
 
-    /// ATERM'S WORD ON A CRASH RELAUNCH ([`Link::may_act`]), waited for while the claim is away.
-    /// A claim that lapsed (aterm closed its connection, as a restart or a seamless update does,
-    /// or no longer shows it proven) or a read aterm did not answer holds the relaunch up to
-    /// `reclaim_hold`, the claim made again every [`crate::aterm::RECLAIM_EVERY`] and the
-    /// relaunch judged again whenever aterm proves it: in a tab this harness leads, no built-in
-    /// lane of aterm's brings the child back (aterm sees no exit, and its relaunch lane knows no
-    /// conversation for the harness's pid), so a crash passed back at once would leave the
-    /// session to nobody. A policy found off or a `[harness] relaunch` that is off passes the
-    /// crash back at once; so does the hold running out, or a `SIGHUP` or `SIGTERM` reaching the
-    /// harness meanwhile.
+    /// KEYS TYPED AT A DEAD SCREEN ARE MEANT FOR NOBODY: drop what was typed and not read while a
+    /// crash relaunch waited, before the relaunched child starts or the harness ends. The
+    /// terminal is back in its starting (cooked, echoing) mode for that wait, so a line typed
+    /// there would otherwise reach the resumed Muse Code as a prompt, or the parent shell as a
+    /// command once the crash is passed on. Only while this job owns the terminal's foreground
+    /// ([`Tty::discard_input`]).
+    fn discard_input(&self) {
+        if let Some(tty) = self.tty {
+            let _ = tty.discard_input();
+        }
+    }
+
+    /// THE CRASH WAIT: the ladder's `pause`, and under aterm aterm's word on the relaunch
+    /// (`Link::relaunch_word` for a crash), asked at once and again once the pause is over, so
+    /// the relaunch stands on a fresh read. aterm away (a lost link, made again every 5 s) or
+    /// answering only later is asked again every second, within [`Config::away_budget`] of time
+    /// actually spent waiting for it: in a tab this harness leads, no built-in lane of aterm's
+    /// brings the child back, so a crash passed on at once would leave the session to nobody.
+    /// Outside aterm only the pause is waited. Restarts aterm asks for meanwhile are refused (no
+    /// child runs to restart), and a `SIGINT`, `SIGQUIT`, `SIGHUP` or `SIGTERM` (or
+    /// `interrupted`) passes the crash on: whoever sends one wants the session over.
     ///
     /// # Errors
-    /// Why the crash is passed back.
-    fn relaunch_word(&mut self, signals: &signals::Signals, vendor: &str) -> Result<(), String> {
-        let grace = self.grace();
-        let hold = self.cfg.reclaim_hold;
-        let deadline = Instant::now() + hold;
-        let mut said = false;
-        loop {
-            let (word, why) = match self
-                .link
-                .may_act(Duty::Relaunch, grace, vendor, &self.journal)
-            {
-                Ok(()) => return Ok(()),
-                Err(held) => held,
+    /// Why the crash is passed on.
+    fn crash_wait(
+        &mut self,
+        signals: &signals::Signals,
+        pause: Duration,
+        vendor: &str,
+        interrupted: bool,
+    ) -> Result<(), String> {
+        let passed_on = |p: signals::Pending| {
+            let which = if p.hup {
+                "SIGHUP"
+            } else if p.term {
+                "SIGTERM"
+            } else {
+                "SIGINT or SIGQUIT"
             };
-            if !matches!(word, "no-claim" | "aterm-unread") {
-                return Err(format!("aterm's word holds it: {why}"));
+            format!("{which} reached the harness while the crash relaunch waited")
+        };
+        if interrupted {
+            return Err(passed_on(signals::Pending {
+                int: true,
+                ..signals::Pending::default()
+            }));
+        }
+        let due = Instant::now() + pause;
+        // Outside aterm no claim was ever made and nothing is asked. In an aterm tab only a link
+        // that held a claim gets this far ([`Harness::after_end`]).
+        let asks = self.link.claims();
+        let mut ask_at = asks.then(Instant::now);
+        let mut budget = AwayBudget::within(self.cfg.away_budget);
+        let mut away = String::new();
+        loop {
+            let now = Instant::now();
+            if let Some(at) = ask_at
+                && now >= at
+            {
+                let ms = aterm::now_ms();
+                let word = self.link.relaunch_word(false, ms);
+                aterm::journal(&mut self.link, &self.journal);
+                match word {
+                    Relaunch::Permitted => {
+                        budget.answered(ms);
+                        if now >= due {
+                            return Ok(());
+                        }
+                        ask_at = Some(due);
+                    }
+                    Relaunch::Denied(why) => return Err(format!("aterm's word: {why}")),
+                    Relaunch::Away(why) | Relaunch::Later(why) => {
+                        if budget.wait(ms) {
+                            self.journal.note(
+                                "CRASH-WAIT",
+                                &format!(
+                                    "aterm did not answer ({why}); asking again within the {} s budget",
+                                    self.cfg.away_budget.as_secs_f32()
+                                ),
+                            );
+                        }
+                        away = why;
+                        ask_at = Some(now + ASK_AGAIN);
+                    }
+                }
             }
-            if Instant::now() >= deadline {
+            if budget.spent(aterm::now_ms()) {
                 return Err(format!(
-                    "aterm's word holds it: {why}; aterm did not prove this harness's claim again within {} s",
-                    hold.as_secs()
+                    "claim-not-proven-again {away}: aterm did not answer within {} ms",
+                    self.cfg.away_budget.as_millis()
                 ));
             }
-            if !said {
-                self.journal.note(
-                    "HOLD",
-                    &format!(
-                        "the crash relaunch waits up to {} s for aterm to prove this harness's claim again: {why}",
-                        hold.as_secs()
-                    ),
-                );
-                said = true;
+            if !asks && now >= due {
+                return Ok(());
             }
-            // Until the next judgement: the claim proven again, else one reclaim period.
-            let next = (Instant::now() + aterm::RECLAIM_EVERY).min(deadline);
-            let was_held = self.link.is_held();
-            while Instant::now() < next {
-                let p = signals.wait(self.cfg.tick);
-                if p.hup || p.term {
-                    return Err(format!(
-                        "{} reached the harness while the crash relaunch waited for aterm",
-                        if p.hup { "SIGHUP" } else { "SIGTERM" }
-                    ));
-                }
-                self.link.tick(vendor, &self.journal);
-                if !was_held && self.link.is_held() {
-                    break;
-                }
+            let p = signals.wait(crash_sleep(now, due, ask_at, self.cfg.tick));
+            if p.hup || p.term || p.int {
+                return Err(passed_on(p));
+            }
+            let child = aterm::child(Some(vendor), None);
+            let ms = aterm::now_ms();
+            self.link.tick(child, ms);
+            let drained = self.link.events(child, ms);
+            aterm::journal(&mut self.link, &self.journal);
+            if let Some(event) = drained.restart {
+                self.journal.note(
+                    "RESTART-REFUSED",
+                    &format!("cause={} crash-pending: no child runs", event.cause),
+                );
             }
         }
     }
@@ -989,13 +1795,26 @@ impl Harness {
             }
             Err(err) => Err(err),
         };
-        // A held claim names the build the session now runs (`vendor=`).
+        // The claim names the child the session now runs ([`Harness::announce`]).
         if let Ok(next) = &started {
-            self.link
-                .announce(&next.build.version.to_string(), &self.journal);
+            self.announce(next);
         }
         started
     }
+}
+
+/// How long one pass of the crash wait ([`Harness::crash_wait`]) waits for a signal at `now`: at
+/// most a `tick`, and no later than aterm's next ask (`ask_at`; none outside aterm) or, while the
+/// ladder's pause runs, its end (`due`). Once the pause is over only the next ask is due: a wait
+/// still capped at a pause long over would be no wait at all, and the harness would spin on a
+/// zero-timeout wait for as long as aterm stayed away (up to its 45 s).
+fn crash_sleep(now: Instant, due: Instant, ask_at: Option<Instant>, tick: Duration) -> Duration {
+    let next = match ask_at {
+        Some(at) if now < due => at.min(due),
+        Some(at) => at,
+        None => due,
+    };
+    tick.min(next.saturating_duration_since(now))
 }
 
 /// Whether `end`, soon after a move started a new build, is that build failing to start:
@@ -1008,6 +1827,30 @@ fn refused_start(end: End) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE CRASH WAIT NEVER SPINS: while the ladder's pause runs it wakes for the earlier of the
+    /// pause's end and aterm's next ask; once the pause is over, with aterm away and asked again
+    /// a second on, it sleeps until that ask (at most a tick). NEGATIVE CONTROL: the wait capped
+    /// at a pause already over was zero there, a busy loop until aterm came back.
+    #[test]
+    fn the_crash_wait_sleeps_until_the_next_ask_once_the_pause_is_over() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let tick = Duration::from_millis(500);
+        let sleep = |now, due, ask: Option<u64>| {
+            crash_sleep(at(now), at(due), ask.map(at), tick).as_millis()
+        };
+        // During the pause.
+        assert_eq!(sleep(0, 1000, Some(300)), 300, "until the next ask");
+        assert_eq!(sleep(0, 200, Some(1000)), 200, "until the pause's end");
+        assert_eq!(sleep(0, 300, None), 300, "outside aterm: the pause alone");
+        assert_eq!(sleep(0, 10_000, None), 500, "never past a tick");
+        // The pause over, aterm away: the next ask is a second on.
+        assert_eq!(sleep(2000, 1000, Some(3000)), 500);
+        assert_eq!(sleep(2000, 1000, Some(2200)), 200);
+        assert_eq!(sleep(2000, 1000, Some(2000)), 0, "an ask due now");
+        assert_eq!(sleep(2000, 1000, Some(1900)), 0, "an ask overdue");
+    }
 
     #[test]
     fn refused_start_excludes_clean_and_user_signal_exits() {
@@ -1033,10 +1876,16 @@ mod tests {
         assert_eq!(c.timing.person_grace_us, 300_000);
         assert_eq!(c.timing.settle_us, 200_000);
         assert_eq!(c.stop_wait, Duration::from_secs(2));
-        assert_eq!(c.crash_budget, Config::PRODUCTION.crash_budget);
-        assert_eq!(c.reclaim_hold, Config::PRODUCTION.reclaim_hold);
-        let held = Config::parse_test_timing("50,100,300,200,2000,1500").expect("six numbers");
-        assert_eq!(held.reclaim_hold, Duration::from_millis(1500));
+        assert_eq!(
+            c.term_grace,
+            Duration::from_secs(2),
+            "a restart's grace is the stop wait"
+        );
+        assert_eq!(c.away_budget, AWAY_BUDGET, "aterm's 45 s unless shortened");
+        let away = Config::parse_test_timing("50,100,300,200,2000,1500").expect("six numbers");
+        assert_eq!(away.away_budget, Duration::from_millis(1500));
+        assert_eq!(Config::PRODUCTION.away_budget, Duration::from_secs(45));
+        assert_eq!(Config::PRODUCTION.term_grace, Duration::from_secs(30));
         assert_eq!(Config::parse_test_timing("1,2,3"), None);
         assert_eq!(Config::parse_test_timing("1,2,3,4,5,6,7"), None);
         assert_eq!(Config::parse_test_timing("1,2,3,4,x"), None);

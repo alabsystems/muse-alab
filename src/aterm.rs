@@ -1,833 +1,553 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE ATERM CLIENT: aterm harness contract 3 and the session's claim, ported from grok-alab's
-//! (`src/aterm.rs` there), which speaks the same contract.
-//!
-//! Under aterm the harness follows the start sequence of aterm's harness design
-//! (`docs/DESIGN-harness-repos-2026-10-24.md` §3.2, §8):
-//!
-//! 1. Find the session's control socket: `ATERM_PARENT_SESSION_ID` names the session, the
-//!    rendezvous directory's `graph/<sid>` names its socket, and the token beside the socket
-//!    opens it (`AUTH <token>`, then `version`).
-//! 2. Read `@<sid> harness policy`. Go on only when its `contract=` set lists
-//!    [`REQUIRED_CONTRACT`] and `effective=on`. A reply without `contract=` is an aterm that
-//!    predates contract 3, and the harness never claims from one (§8.2, the fail-closed rule).
-//! 3. Claim: `meta set supervisor muse-alab@<pid> contract=3 scope=relaunch,upgrade
-//!    version=<this harness> [vendor=<muse>]`. aterm proves it on the kernel's facts (this
-//!    connection's peer is `<pid>`, `<pid>` leads the session's foreground group, and its image
-//!    is a build of `muse-alab` from atpkg's store or its dev link) and answers `OK`, or refuses
-//!    the claim whole.
-//! 4. Confirm with `status`: `supervisor=muse-alab@<pid>` and `supervisor_proven=1`.
-//!
-//! Any step that fails is a pass-through: the harness `exec`s Muse Code in its own place
-//! (`src/main.rs`), and the tab runs `muse` under its own name, supervised by aterm's built-in
-//! Muse Code lanes as if no harness existed. Outside aterm the harness supervises with no claim,
-//! as it always has.
-//!
-//! The claim is bound to its connection: it ends when the harness does, and the harness keeps the
-//! connection for its whole life. Under a held claim the loop ([`crate::supervise`]) reads aterm
-//! afresh before every act (a crash relaunch or a move), re-reads the policy on a clock (the claim
-//! given back while the policy is off, made again once it is back on), makes the claim again when
-//! aterm's socket went away and came back, and re-announces it after a move with the new
-//! `vendor=`.
-//!
-//! This harness never types into the session: `relaunch` and `upgrade` type nothing (§8.1 item
-//! 6), so it never sends `send`, `key`, `paste` or `turn`.
+//! muse-alab's side of its link to aterm. The link itself is the shared library `alab-wire`
+//! (`vendor/alab-harness/crates/alab-wire`, the copy of alab-harness pinned in
+//! `vendor/alab-harness.pin`): the wire, the claim at contract 4 or 3 with its guards (the
+//! roster under contract 3, the scope read back), the [`Link`] state machine with its bounds
+//! and its busy-not-gone rule, aterm's exit judgement and the crash ladder. This module holds
+//! only what is this harness's own: who it is to aterm ([`config`]), the clock its link runs on
+//! ([`now_ms`]), what it claims for a child ([`child`]), whether a move may be weighed at all
+//! under the grant ([`upgrade_held`]), aterm's word at a move's act ([`move_unheld`], which adds
+//! Muse Code's composer and person checks to `alab-wire`'s rule for a move a harness judges by
+//! its own readings), and how the link's notes reach the journal ([`journal`]).
 
-use std::collections::BTreeMap;
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
 use std::time::Duration;
 
+use alab_wire::claim::Human;
+use alab_wire::{Child, ChildProcess, Config, Facts, Link, Reading, SafePoint, Scope, Warrant};
+
 use crate::env::Env;
+use crate::gate::{self, Composer, ComposerWitness};
+use crate::journal::Journal;
 
-/// The contract this harness needs before it claims a session.
-pub const REQUIRED_CONTRACT: u32 = 3;
+/// This harness's id: its row in aterm's roster and registry, and the holder `<id>@<pid>`.
+pub const HOLDER_ID: &str = crate::HARNESS;
+/// The word of the vendor it runs.
+pub const VENDOR_WORD: &str = "muse";
+/// The duties this build performs and claims from aterm: bringing a crashed child back on its
+/// session, and moving it onto another vendor build (or this harness onto another build of
+/// itself). The typing scopes stay unclaimed: this harness types nothing.
+pub const SCOPES: [Scope; 2] = [Scope::Relaunch, Scope::Upgrade];
 
-/// The holder word a claim names (`muse-alab@<pid>`).
-pub const HOLDER_PREFIX: &str = "muse-alab@";
-
-/// The duties this harness claims (aterm's roster row allows exactly these for `muse-alab`).
-pub const SCOPE: &str = "relaunch,upgrade";
-
-/// The variable aterm names the session in.
-pub const SID_ENV: &str = "ATERM_PARENT_SESSION_ID";
-
-/// How long one open or one request may take before the harness gives up on aterm.
-pub const TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How often a lost claim is made again, and how often the policy is re-read under a claim.
-pub const RECLAIM_EVERY: Duration = Duration::from_secs(5);
-
-const MAX_TOKEN_BYTES: u64 = 256;
-const MAX_GRAPH_BYTES: u64 = 16 * 1024;
-const MAX_LINE_BYTES: u64 = 1 << 20;
-
-/// aterm's rendezvous directory: `$XDG_RUNTIME_DIR/aterm`, else
-/// `$HOME/Library/Application Support/aterm`.
+/// Who this harness is to aterm.
+///
+/// # Panics
+/// Never: the id and vendor word are fixed lowercase words, [`SCOPES`] is not empty, and the
+/// build refuses a [`crate::HARNESS_VERSION`] that is not `MAJOR.MINOR.0[+g<sha>]`
+/// (`crate::is_pack_version`), which is a claim's `version=`. The unit test makes this config.
 #[must_use]
-pub fn control_dir(env: &Env) -> Option<PathBuf> {
-    if let Some(xdg) = env.xdg_runtime_dir.as_ref() {
-        return Some(PathBuf::from(xdg).join("aterm"));
-    }
-    Some(
-        env.home()?
-            .join("Library")
-            .join("Application Support")
-            .join("aterm"),
-    )
+pub fn config() -> Config {
+    Config::new(HOLDER_ID, VENDOR_WORD, &SCOPES, crate::HARNESS_VERSION)
+        .expect("muse-alab's id, vendor word, scopes and version are a config aterm reads")
 }
 
-/// Whether `sid` has a session id's shape (`s-<hex>`), so it can never name a path.
+/// `env` as the lookup `alab-wire` reads a session from.
+pub fn lookup(env: &Env) -> impl Fn(&str) -> Option<OsString> + '_ {
+    |name| env.aterm_var(name)
+}
+
+/// Whether this process runs in an aterm tab, by the marks `config` names.
 #[must_use]
-pub fn valid_sid(sid: &str) -> bool {
-    sid.strip_prefix("s-")
-        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+pub fn hosted(env: &Env, config: &Config) -> bool {
+    config.env().hosted_by(lookup(env))
 }
 
-/// The socket a `graph/<sid>` entry names (its `sock <path>` line).
+/// The link's clock: milliseconds since boot on a system clock that stops while the machine
+/// sleeps, the clock `std::time::Instant` reads (`CLOCK_UPTIME_RAW` on macOS, `CLOCK_MONOTONIC`
+/// on Linux). Every crash-ladder window and away budget runs on it, so a closed lid neither
+/// spends the 45 s aterm has to come back nor counts as a healthy run that forgives a crash
+/// streak; aterm's own grace runs on `Instant` too. It is a system clock rather than one a
+/// process starts, so a time carried across a harness re-exec reads the same on both sides.
 #[must_use]
-pub fn graph_sock(body: &str) -> Option<PathBuf> {
-    body.lines()
-        .find_map(|l| l.strip_prefix("sock "))
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
+pub fn now_ms() -> u64 {
+    uptime_ns() / 1_000_000
 }
 
-/// Where the session's control socket is found again (after aterm's socket moved).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Locator {
-    /// The rendezvous directory.
-    pub dir: PathBuf,
-    /// The session id.
-    pub sid: String,
-}
+/// The system clock that stops while the machine sleeps: macOS's `CLOCK_UPTIME_RAW`
+/// (`CLOCK_MONOTONIC` there keeps counting through sleep), Linux's `CLOCK_MONOTONIC`.
+#[cfg(target_os = "macos")]
+const UPTIME_CLOCK: libc::clockid_t = libc::CLOCK_UPTIME_RAW;
+/// The system clock that stops while the machine sleeps (see the macOS twin).
+#[cfg(not(target_os = "macos"))]
+const UPTIME_CLOCK: libc::clockid_t = libc::CLOCK_MONOTONIC;
 
-impl Locator {
-    /// The locator `env` names.
-    ///
-    /// # Errors
-    /// Why no session can be named.
-    pub fn from_env(env: &Env) -> Result<Locator, String> {
-        let sid = env
-            .aterm_sid
-            .clone()
-            .and_then(|v| v.into_string().ok())
-            .ok_or_else(|| format!("{SID_ENV} is not set"))?;
-        if !valid_sid(&sid) {
-            return Err(format!("{SID_ENV} is not a session id"));
-        }
-        let dir = control_dir(env).ok_or("neither XDG_RUNTIME_DIR nor HOME is set")?;
-        Ok(Locator { dir, sid })
-    }
-
-    /// The socket the session's graph entry names now.
-    ///
-    /// # Errors
-    /// Why there is none.
-    pub fn sock(&self) -> Result<PathBuf, String> {
-        let entry = self.dir.join("graph").join(&self.sid);
-        let body = read_regular_file(&entry, MAX_GRAPH_BYTES)
-            .map_err(|e| format!("no graph entry for {} ({e})", self.sid))?;
-        graph_sock(&body).ok_or_else(|| format!("the graph entry for {} names no socket", self.sid))
-    }
-}
-
-/// The token file names to try beside socket file `sock_name`, in order (aterm's own rule:
-/// `aterm-<pid>.sock` has `aterm-<pid>.token`; any other socket its own token, then
-/// `aterm.token`).
-#[must_use]
-pub fn token_names(sock_name: &str) -> Vec<String> {
-    if let Some(pid) = sock_name
-        .strip_suffix(".sock")
-        .and_then(|n| n.strip_prefix("aterm-"))
-        .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-    {
-        return vec![format!("aterm-{pid}.token")];
-    }
-    let own = if sock_name.ends_with(".sock") {
-        format!("{sock_name}.token")
-    } else {
-        format!("aterm-sock-{sock_name}.token")
+/// Nanoseconds on [`UPTIME_CLOCK`].
+fn uptime_ns() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
     };
-    vec![own, "aterm.token".to_string()]
+    // SAFETY: `now` is a writable timespec that outlives the call, which writes only it. The
+    // clock is one every Rust on this platform reads for `Instant`, so the call does not fail;
+    // were it to, `now` stays zero, which reads as no time passed.
+    let _ = unsafe { libc::clock_gettime(UPTIME_CLOCK, &raw mut now) };
+    u64::try_from(now.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(now.tv_nsec).unwrap_or(0))
 }
 
-/// The token beside `sock`, read without following a link and no longer than 256 bytes.
+/// What the claim says about the child: its vendor build and, once it runs, its pid and kernel
+/// start time (`child=` under contract 4). Muse Code runs on no account this harness chooses, so
+/// no `login=` is ever claimed.
+#[must_use]
+pub fn child(vendor: Option<&str>, process: Option<ChildProcess>) -> Child<'_> {
+    Child {
+        vendor,
+        login: None,
+        process,
+    }
+}
+
+/// The kernel start of the process `pid` as aterm checks `child=`, or none when it cannot be
+/// read (left out of the claim rather than guessed).
+#[must_use]
+pub fn process_of(pid: u32) -> Option<ChildProcess> {
+    ChildProcess::of(pid).ok()
+}
+
+/// Whether the standing claim was granted both duties this harness performs. A launch whose
+/// claim was granted less gives it back and runs Muse Code in its place: a narrower grant would
+/// leave a duty to aterm's engine and this harness at once.
+#[must_use]
+pub fn takes_both(link: &Link) -> bool {
+    SCOPES.iter().all(|scope| link.takes(*scope))
+}
+
+/// The granted duties as one journal word.
+#[must_use]
+pub fn granted(link: &Link) -> String {
+    link.grant()
+        .map_or_else(|| "-".to_string(), alab_wire::Grant::words)
+}
+
+/// Whether the harness may move onto another build at all, by the link alone (no I/O). Outside
+/// aterm (`hosted` false, so no link was ever made) the harness's own readings decide, as before
+/// it had a client. In an aterm tab a move is aterm's `upgrade` duty, handed to this harness only
+/// by a standing claim that holds it, so every other state holds the move:
+/// - a link lost and being claimed again, or one aterm has not admitted yet (a launch aterm
+///   answered busy, off for now or not serving a contract this harness claims at), made again
+///   every 5 s (`no-claim`);
+/// - a link aterm refused after such a launch, absent for the session (`no-claim`): aterm never
+///   let this harness lead the tab;
+/// - a claim given back while aterm's policy is off (`policy-off`);
+/// - a grant without `upgrade` (a person's cap, or an aterm that does not know the word), which
+///   leaves the duty to aterm (`upgrade-not-granted`).
+///
+/// A crash relaunch or an asked restart stays on the build the child ran under the same rule
+/// ([`upgrade_granted`]).
 ///
 /// # Errors
-/// No token file, or one that is not a single token in a regular file.
-pub fn read_token_beside(sock: &Path) -> io::Result<String> {
-    let (Some(dir), Some(name)) = (sock.parent(), sock.file_name()) else {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "the socket path names no directory",
-        ));
-    };
-    let name = std::fs::read_link(sock)
-        .ok()
-        .and_then(|t| t.file_name().map(std::ffi::OsStr::to_os_string))
-        .unwrap_or_else(|| name.to_os_string());
-    let mut miss = None;
-    for candidate in token_names(&name.to_string_lossy()) {
-        match read_token_file(&dir.join(candidate)) {
-            Ok(token) => return Ok(token),
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => return Err(e),
-            Err(e) => {
-                miss.get_or_insert(e);
-            }
-        }
-    }
-    Err(miss
-        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no token beside the socket")))
-}
-
-fn read_regular_file(path: &Path, max: u64) -> io::Result<String> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let bad = |why: &str| io::Error::new(io::ErrorKind::InvalidData, why.to_string());
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|e| {
-            if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-                bad("the path is a link")
-            } else {
-                e
-            }
-        })?;
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.len() > max {
-        return Err(bad("the path is not a bounded regular file"));
-    }
-    let mut bytes = Vec::new();
-    // One lookahead byte detects growth past the bound. At u64::MAX no larger
-    // byte count is representable, so that bound needs no lookahead byte.
-    let read_limit = max.checked_add(1).unwrap_or(max);
-    file.take(read_limit).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max {
-        return Err(bad("the file exceeds its bound"));
-    }
-    String::from_utf8(bytes).map_err(|_| bad("the file is not UTF-8"))
-}
-
-fn read_token_file(path: &Path) -> io::Result<String> {
-    let bad = |why: &str| io::Error::new(io::ErrorKind::InvalidData, why.to_string());
-    let raw = read_regular_file(path, MAX_TOKEN_BYTES)?;
-    let token = raw.trim();
-    if token.is_empty() || token.contains(['\r', '\n', ' ', '\t']) {
-        return Err(bad("the token file is not one token"));
-    }
-    Ok(token.to_string())
-}
-
-/// One authenticated connection to the session's control socket. It is close-on-exec (std's
-/// sockets are), so the vendor child never inherits it.
-#[derive(Debug)]
-pub struct Conn {
-    reader: BufReader<UnixStream>,
-    writer: UnixStream,
-    sid: String,
-    /// What aterm's `version` answered (after `OK `).
-    pub version: String,
-}
-
-impl Conn {
-    /// Connect to `sock`, authenticate with the token beside it and read aterm's version.
-    ///
-    /// # Errors
-    /// The socket, the token or the handshake failed.
-    pub fn open(sock: &Path, sid: &str, timeout: Duration) -> io::Result<Conn> {
-        let stream = UnixStream::connect(sock)?;
-        stream.set_read_timeout(Some(timeout))?;
-        stream.set_write_timeout(Some(timeout))?;
-        let token = read_token_beside(sock)?;
-        let writer = stream.try_clone()?;
-        let mut conn = Conn {
-            reader: BufReader::new(stream),
-            writer,
-            sid: sid.to_string(),
-            version: String::new(),
-        };
-        conn.writer
-            .write_all(format!("AUTH {token}\nversion\n").as_bytes())?;
-        conn.writer.flush()?;
-        let line = conn.line()?;
-        match line.strip_prefix("OK ") {
-            Some(version) => {
-                conn.version = version.to_string();
-                Ok(conn)
-            }
-            None => Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("aterm refused the connection: {line}"),
-            )),
-        }
-    }
-
-    fn line(&mut self) -> io::Result<String> {
-        let mut buf = Vec::new();
-        let n = (&mut self.reader)
-            .take(MAX_LINE_BYTES + 1)
-            .read_until(b'\n', &mut buf)?;
-        if n == 0 || buf.last() != Some(&b'\n') {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "aterm closed the connection",
-            ));
-        }
-        buf.pop();
-        if buf.last() == Some(&b'\r') {
-            buf.pop();
-        }
-        Ok(String::from_utf8_lossy(&buf).into_owned())
-    }
-
-    /// Send `@<sid> <verb>` and read aterm's one-line reply.
-    ///
-    /// # Errors
-    /// The connection failed (an `ERR` reply is a reply, not an error).
-    pub fn ask(&mut self, verb: &str) -> io::Result<String> {
-        if verb.contains(['\n', '\r']) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a verb is one line",
-            ));
-        }
-        self.writer
-            .write_all(format!("@{} {verb}\n", self.sid).as_bytes())?;
-        self.writer.flush()?;
-        self.line()
-    }
-
-    /// Whether aterm closed this connection, read without waiting and without sending a word.
-    /// aterm sends nothing unasked on a request connection, so a connection that polls readable
-    /// between requests has ended (aterm restarted, or a seamless update dropped it), and the
-    /// claim bound to it with it.
-    #[must_use]
-    pub fn closed(&self) -> bool {
-        use std::os::fd::AsRawFd;
-        if !self.reader.buffer().is_empty() {
-            return false;
-        }
-        let fd = self.writer.as_raw_fd();
-        let mut p = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `poll` on one live pollfd this function owns, with no wait.
-        let n = unsafe { libc::poll(&raw mut p, 1, 0) };
-        if n <= 0 {
-            return false;
-        }
-        if p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-            return true;
-        }
-        let mut byte = 0_u8;
-        // SAFETY: a one-byte peek into the live local on this connection's socket.
-        let got = unsafe {
-            libc::recv(
-                fd,
-                (&raw mut byte).cast(),
-                1,
-                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-            )
-        };
-        got == 0
-    }
-}
-
-/// A reply's `key=value` fields (after its `OK`), the values as sent (still pct-encoded).
-#[must_use]
-pub fn fields(reply: &str) -> BTreeMap<String, String> {
-    reply
-        .split_ascii_whitespace()
-        .skip_while(|w| *w == "OK")
-        .filter_map(|w| w.split_once('='))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
-}
-
-/// `%XX`-decode a wire value.
-#[must_use]
-pub fn pct_decode(s: &str) -> String {
-    let hex = |b: u8| {
-        char::from(b)
-            .to_digit(16)
-            .and_then(|d| u8::try_from(d).ok())
-    };
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while let Some(&b) = bytes.get(i) {
-        if b == b'%'
-            && let (Some(hi), Some(lo)) = (
-                bytes.get(i + 1).copied().and_then(hex),
-                bytes.get(i + 2).copied().and_then(hex),
-            )
-        {
-            out.push(hi << 4 | lo);
-            i += 3;
-            continue;
-        }
-        out.push(b);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn switch(f: &BTreeMap<String, String>, key: &str) -> Option<bool> {
-    match f.get(key).map(String::as_str) {
-        Some("true") => Some(true),
-        Some("false") => Some(false),
-        _ => None,
-    }
-}
-
-/// What `harness policy` answered, as far as this harness reads it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Policy {
-    /// The contracts aterm serves (`contract=2,3`); empty when the reply carries none.
-    pub contracts: Vec<u32>,
-    /// `effective=on`.
-    pub effective: bool,
-    /// `why=`.
-    pub why: String,
-    /// `[harness] upgrade`.
-    pub upgrade: Option<bool>,
-    /// `[harness] relaunch`.
-    pub relaunch: Option<bool>,
-}
-
-impl Policy {
-    /// Read a `harness policy` reply.
-    ///
-    /// # Errors
-    /// The reply is not `OK` (aterm refused or does not know the verb).
-    pub fn parse(reply: &str) -> Result<Policy, String> {
-        if reply != "OK" && !reply.starts_with("OK ") {
-            return Err(format!("harness policy answered {reply}"));
-        }
-        let f = fields(reply);
-        // A contract word that is not a number is no contract this harness can serve; the
-        // rest of the set stands.
-        let contracts = f
-            .get("contract")
-            .map(|v| v.split(',').filter_map(|n| n.parse::<u32>().ok()).collect())
-            .unwrap_or_default();
-        Ok(Policy {
-            contracts,
-            effective: f.get("effective").is_some_and(|v| v == "on"),
-            why: f
-                .get("why")
-                .map_or_else(|| "-".to_string(), |v| pct_decode(v)),
-            upgrade: switch(&f, "upgrade"),
-            relaunch: switch(&f, "relaunch"),
-        })
-    }
-
-    /// Whether aterm serves contract `n`.
-    #[must_use]
-    pub fn serves(&self, n: u32) -> bool {
-        self.contracts.contains(&n)
-    }
-
-    /// Whether this policy lets the harness hold the session: contract 3 served and the policy on
-    /// for it.
-    #[must_use]
-    pub fn on(&self) -> bool {
-        self.effective && self.serves(REQUIRED_CONTRACT)
-    }
-}
-
-/// The vendor version as a claim's `vendor=` word, or `None` when it is not one (aterm takes
-/// at most 64 bytes of ASCII letters, digits and `.-+_`).
-#[must_use]
-pub fn vendor_word(version: Option<&str>) -> Option<&str> {
-    version.filter(|v| {
-        !v.is_empty()
-            && v.len() <= 64
-            && v.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b))
-    })
-}
-
-/// This harness's holder word for process `pid`.
-#[must_use]
-pub fn holder(pid: u32) -> String {
-    format!("{HOLDER_PREFIX}{pid}")
-}
-
-/// The claim's verb: `meta set supervisor muse-alab@<pid> contract=3 scope=relaunch,upgrade
-/// version=<version> [vendor=<vendor>]`.
-#[must_use]
-pub fn claim_verb(pid: u32, version: &str, vendor: Option<&str>) -> String {
-    let mut verb = format!(
-        "meta set supervisor {} contract={REQUIRED_CONTRACT} scope={SCOPE} version={version}",
-        holder(pid)
-    );
-    if let Some(v) = vendor_word(vendor) {
-        verb.push_str(" vendor=");
-        verb.push_str(v);
-    }
-    verb
-}
-
-/// When a person last typed, as `status human_ms=` says.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Human {
-    /// `human_ms=-`: nobody has typed in this session.
-    Never,
-    /// `human_ms=<n>`.
-    Ago(Duration),
-    /// No reading.
-    Unknown,
-}
-
-impl Human {
-    /// Whether a person may have typed within `grace` (an unread clock counts as typing).
-    #[must_use]
-    pub fn within(self, grace: Duration) -> bool {
-        match self {
-            Human::Never => false,
-            Human::Ago(ago) => ago < grace,
-            Human::Unknown => true,
-        }
-    }
-}
-
-/// What `status` says of the session, as far as this harness reads it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Screen {
-    /// `supervisor=` (decoded), `None` for `-` or absent.
-    pub supervisor: Option<String>,
-    /// `supervisor_proven=1`.
-    pub proven: bool,
-    /// `human_ms=`.
-    pub human: Human,
-}
-
-impl Screen {
-    /// Read a `status` reply.
-    ///
-    /// # Errors
-    /// The reply is not `OK`, or is not schema 1.
-    pub fn parse(reply: &str) -> Result<Screen, String> {
-        if !reply.starts_with("OK ") {
-            return Err(format!("status answered {reply}"));
-        }
-        let f = fields(reply);
-        let schema = f
-            .get("schema")
-            .and_then(|s| s.split('.').next())
-            .and_then(|s| s.parse::<u32>().ok());
-        if schema != Some(1) {
-            return Err("status is not schema 1".to_string());
-        }
-        Ok(Screen {
-            supervisor: f
-                .get("supervisor")
-                .map(|v| pct_decode(v))
-                .filter(|s| s != "-"),
-            proven: f.get("supervisor_proven").is_some_and(|v| v == "1"),
-            human: match f.get("human_ms").map(String::as_str) {
-                Some("-") => Human::Never,
-                Some(ms) => ms
-                    .parse::<u64>()
-                    .map_or(Human::Unknown, |ms| Human::Ago(Duration::from_millis(ms))),
-                None => Human::Unknown,
-            },
-        })
-    }
-
-    /// Whether `holder`'s claim is the session's, proven.
-    #[must_use]
-    pub fn held_by(&self, holder: &str) -> bool {
-        self.proven && self.supervisor.as_deref() == Some(holder)
-    }
-}
-
-/// A claim aterm proved, and the connection it is bound to.
-#[derive(Debug)]
-pub struct Claimed {
-    /// The connection the claim is bound to (kept open for the harness's whole life).
-    pub conn: Conn,
-    /// `muse-alab@<pid>`.
-    pub holder: String,
-    /// The policy as last read.
-    pub policy: Policy,
-    /// Where the socket is found again.
-    pub locator: Locator,
-}
-
-impl Claimed {
-    /// Give the claim back (`meta unset supervisor holder=<holder>`), keeping the connection,
-    /// so it can be made again on it.
-    ///
-    /// # Errors
-    /// The connection failed, or aterm refused.
-    pub fn release(&mut self) -> Result<(), String> {
-        let reply = self
-            .conn
-            .ask(&format!("meta unset supervisor holder={}", self.holder))
-            .map_err(|e| e.to_string())?;
-        if reply == "OK" || reply.starts_with("OK ") {
-            Ok(())
+/// The wait word and why.
+pub fn upgrade_held(link: &Link, hosted: bool) -> Result<(), (&'static str, String)> {
+    if link.is_absent() {
+        if hosted {
+            Err((
+                "no-claim",
+                "aterm refused this harness's claim; the session's moves stay aterm's".to_string(),
+            ))
         } else {
-            Err(reply)
+            Ok(())
         }
-    }
-
-    /// Claim again on this connection and confirm it with `status`; a claim aterm stored but
-    /// did not confirm as proven is let go.
-    ///
-    /// # Errors
-    /// The connection failed, aterm refused, or the claim did not read back proven.
-    pub fn claim_again(
-        &mut self,
-        pid: u32,
-        version: &str,
-        vendor: Option<&str>,
-    ) -> Result<(), String> {
-        self.reclaim(pid, version, vendor)
-            .map_err(|why| format!("aterm refused the claim: {why}"))?;
-        let screen = self.screen()?;
-        if screen.held_by(&self.holder) {
-            return Ok(());
-        }
-        let _ = self.release();
-        Err(format!(
-            "aterm did not confirm the claim (supervisor={} supervisor_proven={})",
-            screen.supervisor.as_deref().unwrap_or("-"),
-            u8::from(screen.proven)
+    } else if link.is_lost() {
+        let why = if link.claims() {
+            "aterm does not hold this harness's claim; it is made again every 5 s"
+        } else {
+            "aterm has not admitted this harness's claim yet; it is made again every 5 s"
+        };
+        Err(("no-claim", why.to_string()))
+    } else if link.grant().is_none() {
+        Err((
+            "policy-off",
+            "the claim was given back while aterm's harness policy is off".to_string(),
+        ))
+    } else if link.takes(Scope::Upgrade) {
+        Ok(())
+    } else {
+        Err((
+            "upgrade-not-granted",
+            format!("aterm granted scope={}", granted(link)),
         ))
     }
+}
 
-    /// Re-read `harness policy` into [`Self::policy`].
-    ///
-    /// # Errors
-    /// The connection failed, or the reply is not a policy.
-    pub fn refresh_policy(&mut self) -> Result<&Policy, String> {
-        let reply = self.conn.ask("harness policy").map_err(|e| e.to_string())?;
-        self.policy = Policy::parse(&reply)?;
-        Ok(&self.policy)
+/// Whether a relaunch may start a newer build than the one the child ran: the move is aterm's
+/// `upgrade` duty, so only outside aterm or under a grant that takes it ([`upgrade_held`]).
+#[must_use]
+pub fn upgrade_granted(link: &Link, hosted: bool) -> bool {
+    upgrade_held(link, hosted).is_ok()
+}
+
+/// aterm's word at a move's act, once the harness's own readings call the moment safe: one
+/// fresh policy and status read ([`Link::read`]) judged by [`judge_move`]. Outside aterm the
+/// composer is judged on the input clock `local` alone. In an aterm tab, a link holding no
+/// standing claim of `upgrade`, before the read or after it, holds the move ([`upgrade_held`]);
+/// so does any hold aterm states in place of facts.
+///
+/// # Errors
+/// The wait word and why.
+pub fn move_unheld(
+    link: &mut Link,
+    hosted: bool,
+    grace: Duration,
+    local: ComposerWitness,
+    now_ms: u64,
+) -> Result<(), (&'static str, String)> {
+    upgrade_held(link, hosted)?;
+    if link.is_absent() {
+        // Outside aterm: no link, and the harness's own readings decide.
+        return gate::check_composer(local).map_err(|word| (word, composer_why(word, None)));
     }
-
-    /// Read `status`.
-    ///
-    /// # Errors
-    /// The connection failed, or the reply is not a status.
-    pub fn screen(&mut self) -> Result<Screen, String> {
-        let reply = self.conn.ask("status").map_err(|e| e.to_string())?;
-        Screen::parse(&reply)
+    let holder = link.config().holder(std::process::id());
+    match link.read(now_ms) {
+        Reading::Fresh(facts) => judge_move(&facts, &holder, grace, local),
+        Reading::Hold(why) => Err((
+            "aterm-hold",
+            why.strip_prefix("wait ").unwrap_or(&why).to_string(),
+        )),
+        // The read lost the link, or released a claim the policy no longer admits.
+        Reading::Local => upgrade_held(link, hosted).and(Err((
+            "aterm-unread",
+            "aterm gave no facts for the move".to_string(),
+        ))),
     }
+}
 
-    /// Claim again on this connection (a new `vendor=` after a move).
-    ///
-    /// # Errors
-    /// The connection failed, or aterm refused.
-    pub fn reclaim(&mut self, pid: u32, version: &str, vendor: Option<&str>) -> Result<(), String> {
-        let reply = self
-            .conn
-            .ask(&claim_verb(pid, version, vendor))
-            .map_err(|e| e.to_string())?;
-        if reply == "OK" || reply.starts_with("OK ") {
-            Ok(())
-        } else {
-            Err(reply)
+/// aterm's facts on a move the harness's own readings called safe. First `alab-wire`'s rule for
+/// such a move ([`alab_wire::claim::judge_own_move`] with [`Warrant::Harness`]): the claim is
+/// still `holder`'s, proven and takes `upgrade`; aterm reads no halt and no other driver's hand;
+/// and the policy has upgrades on and asks nobody to say when. Then what aterm sees of Muse
+/// Code that the harness cannot: a person's last key (`human_ms`, within the longer of aterm's
+/// `human_grace_s` and the harness's own `grace`, an unknown one holding) and the composer
+/// (`composer=`, aterm's screen reader; where aterm serves none, the input clock `local`).
+///
+/// # Errors
+/// The wait word and why.
+pub fn judge_move(
+    facts: &Facts,
+    holder: &str,
+    grace: Duration,
+    local: ComposerWitness,
+) -> Result<(), (&'static str, String)> {
+    if let SafePoint::Hold(hold) =
+        alab_wire::claim::judge_own_move(&facts.policy, &facts.status, holder, Warrant::Harness)
+    {
+        return Err(("aterm-hold", format!("aterm {}={}", hold.field, hold.value)));
+    }
+    let grace = facts.policy.human_grace.max(grace);
+    match facts.status.human {
+        Human::Never => {}
+        Human::Ago(ago) if ago >= grace => {}
+        Human::Ago(ago) => {
+            return Err((
+                "person-typing",
+                format!(
+                    "aterm saw a person type {} ms ago (human_ms), within {} ms",
+                    ago.as_millis(),
+                    grace.as_millis()
+                ),
+            ));
+        }
+        Human::Unknown => {
+            return Err((
+                "person-typing",
+                "aterm's human_ms is absent or unreadable".to_string(),
+            ));
+        }
+    }
+    let served = facts.status.composer.as_deref().map(Composer::parse);
+    gate::check_composer(ComposerWitness::of(served, local))
+        .map_err(|word| (word, composer_why(word, served)))
+}
+
+/// Why the composer witness held a move with `word`, aterm having served `served`.
+fn composer_why(word: &str, served: Option<Composer>) -> String {
+    match served {
+        Some(Composer::Draft) => {
+            "aterm reads a person's draft in the composer (composer=draft)".into()
+        }
+        Some(_) => "aterm does not read the composer as empty or a placeholder (composer=-)".into(),
+        None if word == "no-input-clock" => {
+            "no terminal input clock proves the composer empty, and aterm serves no composer="
+                .into()
+        }
+        None => {
+            "the terminal delivered input since the last submission, and aterm serves no composer="
+                .into()
         }
     }
 }
 
-/// The start sequence's aterm steps (socket, policy, claim, confirmation) for process `pid`,
-/// harness `version` and vendor version `vendor`: a proven claim, or why the harness passes
-/// through.
-///
-/// # Errors
-/// Why the harness does not hold the session.
-pub fn claim(
-    locator: &Locator,
-    pid: u32,
-    version: &str,
-    vendor: Option<&str>,
-    timeout: Duration,
-) -> Result<Claimed, String> {
-    let sock = locator.sock()?;
-    let mut conn = Conn::open(&sock, &locator.sid, timeout)
-        .map_err(|e| format!("cannot open aterm's control socket {}: {e}", sock.display()))?;
-    let reply = conn
-        .ask("harness policy")
-        .map_err(|e| format!("harness policy: {e}"))?;
-    let policy = Policy::parse(&reply)?;
-    if !policy.serves(REQUIRED_CONTRACT) {
-        return Err(format!(
-            "aterm does not serve harness contract {REQUIRED_CONTRACT} (contract={})",
-            if policy.contracts.is_empty() {
-                "absent".to_string()
-            } else {
-                policy
-                    .contracts
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            }
-        ));
+/// Write the link's notes to the journal: `aterm <verb> <rest>` becomes the event `<VERB>` with
+/// `<rest>` (`aterm claimed holder=… contract=4 …` is `CLAIMED holder=… contract=4 …`).
+pub fn journal(link: &mut Link, journal: &Journal) {
+    for line in link.take_notes() {
+        let rest = line.strip_prefix("aterm ").unwrap_or(&line);
+        let (verb, detail) = rest.split_once(' ').unwrap_or((rest, ""));
+        journal.note(&verb.to_ascii_uppercase(), detail);
     }
-    if !policy.effective {
-        return Err(format!(
-            "aterm's harness policy is off for this session (why={})",
-            policy.why
-        ));
-    }
-    let mut claimed = Claimed {
-        conn,
-        holder: holder(pid),
-        policy,
-        locator: locator.clone(),
-    };
-    // Never leave a claim aterm did not confirm as proven standing ([`Claimed::claim_again`]
-    // lets it go).
-    claimed.claim_again(pid, version, vendor)?;
-    Ok(claimed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
 
-    fn env(sid: Option<&str>, runtime: Option<&str>, home: Option<&str>) -> Env {
-        Env {
-            aterm_sid: sid.map(OsString::from),
-            xdg_runtime_dir: runtime.map(OsString::from),
-            home: home.map(PathBuf::from),
-            ..Env::default()
-        }
+    #[test]
+    fn this_harness_is_muse_alab_claiming_relaunch_and_upgrade() {
+        let config = config();
+        assert_eq!(config.id(), "muse-alab");
+        assert_eq!(config.vendor(), "muse");
+        assert_eq!(config.scopes(), [Scope::Relaunch, Scope::Upgrade]);
+        assert_eq!(config.holder(77), "muse-alab@77");
+        assert_eq!(config.version(), crate::HARNESS_VERSION);
     }
 
     #[test]
-    fn regular_file_bounds_include_zero_and_u64_max() {
-        let dir = std::env::temp_dir().join(format!(
-            "muse-alab-regular-file-bounds-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("input");
-        std::fs::write(&path, "").unwrap();
-        assert_eq!(read_regular_file(&path, 0).unwrap(), "");
-
-        std::fs::write(&path, "ok").unwrap();
-        assert_eq!(read_regular_file(&path, 2).unwrap(), "ok");
-        assert_eq!(
-            read_regular_file(&path, 1).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(read_regular_file(&path, u64::MAX).unwrap(), "ok");
-
-        std::fs::write(&path, [0xff]).unwrap();
-        assert_eq!(
-            read_regular_file(&path, u64::MAX).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        std::fs::remove_dir_all(dir).unwrap();
+    fn the_session_is_read_from_the_harnesss_own_environment() {
+        let config = config();
+        let hosted_by = |pairs: &[(&str, &str)]| hosted(&Env::with_aterm_vars(pairs), &config);
+        assert!(hosted_by(&[("TERM_PROGRAM", "aterm")]));
+        assert!(hosted_by(&[("ATERM_CHILD", "1")]));
+        assert!(hosted_by(&[("ATERM_SESSION_ID", "s-1")]));
+        assert!(!hosted_by(&[("TERM_PROGRAM", "iTerm.app")]));
+        assert!(!hosted_by(&[("ATERM_CHILD", "0")]));
+        assert!(!hosted_by(&[]));
     }
 
+    /// The link's clock leaves out the time the machine slept, as `Instant` does: on macOS it
+    /// reads `CLOCK_UPTIME_RAW`, not `CLOCK_MONOTONIC`, which counts sleep. On a Mac that has
+    /// slept since boot the two differ by that sleep, so a `CLOCK_MONOTONIC` reading falls
+    /// outside the window this reads around it.
     #[test]
-    fn the_session_is_named_by_its_id_and_found_through_the_graph() {
-        assert!(valid_sid("s-00ff"));
-        for bad in ["s-", "s-xyz", "../x", "s-1/2", "1f"] {
-            assert!(!valid_sid(bad), "{bad}");
-        }
-        let l = Locator::from_env(&env(Some("s-1a"), Some("/run/u"), None)).unwrap();
-        assert_eq!(l.dir, PathBuf::from("/run/u/aterm"));
-        let l = Locator::from_env(&env(Some("s-1a"), None, Some("/h"))).unwrap();
-        assert_eq!(l.dir, PathBuf::from("/h/Library/Application Support/aterm"));
-        assert!(Locator::from_env(&env(Some("s-../x"), None, Some("/h"))).is_err());
-        assert!(Locator::from_env(&env(None, None, Some("/h"))).is_err());
-        assert_eq!(
-            graph_sock("pid 1\nsock /a/b.sock\n"),
-            Some(PathBuf::from("/a/b.sock"))
-        );
-        assert_eq!(graph_sock("sock relative.sock\n"), None);
-        assert_eq!(graph_sock("sock \n"), None);
-    }
-
-    #[test]
-    fn the_token_is_found_by_aterms_rule() {
-        assert_eq!(token_names("aterm-77.sock"), ["aterm-77.token"]);
-        assert_eq!(token_names("c.sock"), ["c.sock.token", "aterm.token"]);
-        assert_eq!(token_names("ctl"), ["aterm-sock-ctl.token", "aterm.token"]);
-    }
-
-    /// THE FAIL-CLOSED RULE (§8.2): only a reply that lists contract 3 and is on lets the harness
-    /// hold the session; an aterm that predates contract 3 says no `contract=` at all.
-    #[test]
-    fn only_a_policy_serving_contract_three_and_on_holds_the_session() {
-        let p = Policy::parse(
-            "OK gen=4 effective=on why=enabled contract=2,3 relaunch=true upgrade=true",
-        )
-        .unwrap();
-        assert!(p.serves(3) && p.serves(2) && !p.serves(4) && p.on());
-        assert_eq!((p.upgrade, p.relaunch), (Some(true), Some(true)));
-        let old = Policy::parse("OK gen=4 effective=on why=enabled upgrade=true").unwrap();
-        assert!(old.contracts.is_empty() && !old.on());
-        let two = Policy::parse("OK gen=1 effective=on why=enabled contract=2").unwrap();
-        assert!(!two.on());
-        let junk = Policy::parse("OK gen=1 effective=on contract=x,3").unwrap();
-        assert!(junk.on());
-        let off = Policy::parse("OK gen=1 effective=off why=autopilot-off contract=2,3").unwrap();
-        assert!(!off.on());
-        assert_eq!(off.why, "autopilot-off");
-        assert!(Policy::parse("ERR usage: harness policy").is_err());
-        assert!(Policy::parse("OKAY contract=3").is_err());
-    }
-
-    #[test]
-    fn the_claim_names_its_holder_contract_scope_and_versions() {
-        assert!(HOLDER_PREFIX.starts_with(crate::HARNESS));
-        assert_eq!(
-            claim_verb(412, "0.1.0", Some("1.4.13-R6996.1")),
-            "meta set supervisor muse-alab@412 contract=3 scope=relaunch,upgrade version=0.1.0 vendor=1.4.13-R6996.1"
-        );
-        assert_eq!(
-            claim_verb(412, "0.1.0", Some("build 7")),
-            "meta set supervisor muse-alab@412 contract=3 scope=relaunch,upgrade version=0.1.0",
-            "a vendor version that is no wire word is left out, never sent half-escaped"
-        );
-        assert_eq!(vendor_word(Some(&"9".repeat(65))), None);
-        assert_eq!(vendor_word(None), None);
-    }
-
-    #[test]
-    fn the_status_reply_says_whose_claim_stands_and_when_a_person_typed() {
-        let s = Screen::parse(
-            "OK schema=1.4 hold=0 human_ms=- supervisor=muse-alab%40412 supervisor_proven=1",
-        )
-        .unwrap();
-        assert!(s.held_by("muse-alab@412"));
-        assert!(!s.held_by("muse-alab@413"));
-        assert!(!s.human.within(Duration::from_secs(120)));
-        let s =
-            Screen::parse("OK schema=1 supervisor=muse-alab@1 supervisor_proven=0 human_ms=250")
-                .unwrap();
-        assert!(!s.held_by("muse-alab@1"), "an unproven claim is not held");
-        assert!(s.human.within(Duration::from_secs(1)));
-        assert!(!s.human.within(Duration::from_millis(250)));
+    fn the_clock_is_the_uptime_clock_that_stops_in_sleep() {
+        let raw_ms = || {
+            let mut now = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `now` is a writable timespec that outlives the call, which writes only it.
+            let rc = unsafe { libc::clock_gettime(UPTIME_CLOCK, &raw mut now) };
+            assert_eq!(rc, 0);
+            u64::try_from(now.tv_sec).unwrap() * 1_000
+                + u64::try_from(now.tv_nsec).unwrap() / 1_000_000
+        };
+        let before = raw_ms();
+        let now = now_ms();
+        let after = raw_ms();
         assert!(
-            Screen::parse("OK schema=1 human_ms=x")
-                .unwrap()
-                .human
-                .within(Duration::ZERO),
-            "an unread clock counts as typing"
+            (before..=after).contains(&now),
+            "{now} is not between {before} and {after}"
         );
-        assert!(Screen::parse("OK schema=2 hold=0").is_err());
-        assert!(Screen::parse("ERR no such session").is_err());
-        assert_eq!(pct_decode("a%20b%zz%4"), "a b%zz%4");
+        #[cfg(target_os = "macos")]
+        assert_eq!(UPTIME_CLOCK, libc::CLOCK_UPTIME_RAW);
+    }
+
+    /// The policy in effect, upgrades on, nobody asked to say when.
+    const ON: &str = "effective=on why=enabled upgrade=true upgrade_ask=false";
+
+    fn facts(policy: &str, status: &str) -> Facts {
+        Facts {
+            policy: alab_wire::Policy::parse(&format!(
+                "OK gen=1 contract=2,3,4 relaunch=true human_grace_s=120 {policy}"
+            ))
+            .unwrap(),
+            status: alab_wire::Status::parse(&format!(
+                "OK schema=1 supervisor=muse-alab%4077 supervisor_proven=1 \
+                 supervisor_scope=relaunch,upgrade {status}"
+            ))
+            .unwrap(),
+        }
+    }
+
+    const HOLDER: &str = "muse-alab@77";
+    const GRACE: Duration = Duration::from_secs(1);
+    /// The input clock: nothing typed since the last submission.
+    const QUIET: ComposerWitness = ComposerWitness::InputClock {
+        last_input_us: Some(100),
+        submitted_us: 200,
+    };
+    /// The input clock: input since the last submission.
+    const TYPED: ComposerWitness = ComposerWitness::InputClock {
+        last_input_us: Some(300),
+        submitted_us: 200,
+    };
+    const FREE: &str = "hold=0 hand=- human_ms=- composer=empty";
+
+    /// `alab-wire`'s rule for a move a harness judges by its own readings comes first: the claim,
+    /// no halt, no other driver, and the policy's two upgrade switches.
+    #[test]
+    fn a_move_needs_the_claim_no_halt_no_driver_and_both_switches() {
+        assert_eq!(judge_move(&facts(ON, FREE), HOLDER, GRACE, QUIET), Ok(()));
+        for (policy, status, why) in [
+            (
+                ON,
+                "hold=1 hand=- human_ms=- composer=empty",
+                "aterm hold=1",
+            ),
+            (
+                ON,
+                "hold=0 hand=lease:driver%404 human_ms=- composer=empty",
+                "aterm hand=lease:driver%25404",
+            ),
+            (
+                "effective=on why=enabled upgrade=false upgrade_ask=false",
+                FREE,
+                "aterm upgrade=false",
+            ),
+            (
+                "effective=on why=enabled upgrade=true upgrade_ask=true",
+                FREE,
+                "aterm upgrade_ask=true",
+            ),
+        ] {
+            assert_eq!(
+                judge_move(&facts(policy, status), HOLDER, GRACE, QUIET),
+                Err(("aterm-hold", why.to_string())),
+                "{policy} / {status}"
+            );
+        }
+        assert_eq!(
+            judge_move(&facts(ON, FREE), "muse-alab@78", GRACE, QUIET),
+            Err(("aterm-hold", "aterm supervisor=muse-alab@77".to_string()))
+        );
+    }
+
+    /// A person aterm saw type within the longer of its grace and the harness's holds the move,
+    /// and so does a `human_ms` aterm could not say.
+    #[test]
+    fn a_move_waits_out_the_longer_person_grace() {
+        let held = |human: &str, grace: Duration| {
+            judge_move(
+                &facts(ON, &format!("hold=0 hand=- composer=empty {human}")),
+                HOLDER,
+                grace,
+                QUIET,
+            )
+            .map_err(|(word, _)| word)
+        };
+        assert_eq!(held("human_ms=119000", GRACE), Err("person-typing"));
+        assert_eq!(held("human_ms=120000", GRACE), Ok(()));
+        assert_eq!(
+            held("human_ms=120000", Duration::from_secs(200)),
+            Err("person-typing"),
+            "the harness's grace can lengthen aterm's"
+        );
+        assert_eq!(held("human_ms=-", GRACE), Ok(()));
+        assert_eq!(held("", GRACE), Err("person-typing"));
+        assert_eq!(held("human_ms=soon", GRACE), Err("person-typing"));
+    }
+
+    /// THE COMPOSER IS aterm's WORD WHERE aterm SERVES ONE: `empty` and `placeholder` let a move
+    /// go however the input clock reads, `draft` and `-` hold it; with no `composer=` served the
+    /// input clock judges.
+    #[test]
+    fn the_composer_is_aterms_word_where_aterm_serves_one() {
+        let with = |composer: &str, local| {
+            judge_move(
+                &facts(ON, &format!("hold=0 hand=- human_ms=- {composer}")),
+                HOLDER,
+                GRACE,
+                local,
+            )
+            .map_err(|(word, _)| word)
+        };
+        assert_eq!(with("composer=empty", TYPED), Ok(()));
+        assert_eq!(with("composer=placeholder", TYPED), Ok(()));
+        assert_eq!(with("composer=draft", QUIET), Err("draft"));
+        assert_eq!(with("composer=-", QUIET), Err("composer-unproven"));
+        assert_eq!(with("", QUIET), Ok(()));
+        assert_eq!(with("", TYPED), Err("draft-unproven"));
+    }
+
+    /// With no claim ever made (outside aterm) a move is the harness's own: nothing is read
+    /// from aterm, the grant holds nothing, and the input clock judges the composer.
+    #[test]
+    fn outside_aterm_a_move_is_judged_on_the_input_clock_alone() {
+        let mut link = Link::absent(config(), 77);
+        assert_eq!(upgrade_held(&link, false), Ok(()));
+        assert!(upgrade_granted(&link, false));
+        assert_eq!(move_unheld(&mut link, false, GRACE, QUIET, 0), Ok(()));
+        assert_eq!(
+            move_unheld(&mut link, false, GRACE, TYPED, 0).map_err(|(word, _)| word),
+            Err("draft-unproven")
+        );
+        assert!(link.take_notes().is_empty());
+    }
+
+    /// The move's word on `link` in an aterm tab, the session quiet: the wait word, or none.
+    fn hosted_move(link: &mut Link) -> Result<(), &'static str> {
+        move_unheld(link, true, GRACE, QUIET, now_ms()).map_err(|(word, _)| word)
+    }
+
+    /// IN AN aterm TAB A MOVE NEEDS A STANDING CLAIM: a launch aterm has not admitted yet (here
+    /// Autopilot off, a link lost that never held a claim) and a link aterm refused after it
+    /// (absent for the session) hold every move, however quiet the session, and read nothing of
+    /// aterm, where outside aterm the same quiet session moves. A claim that stands with
+    /// `upgrade` lets the move go on aterm's fresh read.
+    #[test]
+    fn in_an_aterm_tab_a_move_needs_a_standing_claim() {
+        let aterm = alab_wire::fake::FakeAterm::for_harness("muse-alab-unit-unclaimed", &config());
+        aterm.set_policy(&alab_wire::fake::POLICY_ON.replace(
+            "effective=on why=enabled",
+            "effective=off why=autopilot-off",
+        ));
+        let lookup = aterm.lookup(config().env());
+        let me = std::process::id();
+        let mut link = Link::launch_with(config(), me, child(Some("1.4.10"), None), 0, &lookup);
+        assert!(link.is_lost() && !link.claims(), "{:?}", link.take_notes());
+        let verbs = aterm.verbs().len();
+        assert_eq!(
+            upgrade_held(&link, true).map_err(|(w, _)| w),
+            Err("no-claim")
+        );
+        assert!(!upgrade_granted(&link, true));
+        assert_eq!(hosted_move(&mut link), Err("no-claim"));
+        assert_eq!(aterm.verbs().len(), verbs, "nothing asked of aterm");
+
+        // aterm refuses the claim made again (no registry row proves it): absent for good.
+        aterm.set_registered(false);
+        aterm.set_policy(alab_wire::fake::POLICY_ON);
+        link.tick(child(Some("1.4.10"), None), now_ms() + 60_000);
+        assert!(link.is_absent(), "{:?}", link.take_notes());
+        assert_eq!(
+            upgrade_held(&link, true).map_err(|(w, _)| w),
+            Err("no-claim")
+        );
+        assert!(!upgrade_granted(&link, true));
+        assert_eq!(hosted_move(&mut link), Err("no-claim"));
+        assert_eq!(upgrade_held(&link, false), Ok(()), "outside aterm it moves");
+
+        // A claim that stands, with `upgrade`, is asked at the act.
+        aterm.set_registered(true);
+        let mut held = Link::launch_with(config(), me, child(Some("1.4.10"), None), 0, &lookup);
+        assert!(held.judges(), "{:?}", held.take_notes());
+        assert_eq!(upgrade_held(&held, true), Ok(()));
+        assert!(upgrade_granted(&held, true));
+        let verbs = aterm.verbs().len();
+        assert_eq!(hosted_move(&mut held), Ok(()));
+        assert!(aterm.verbs().len() > verbs, "aterm read at the act");
+    }
+
+    #[test]
+    fn the_links_notes_become_journal_events() {
+        let dir =
+            std::env::temp_dir().join(format!("muse-alab-aterm-notes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = Journal::open(&Env {
+            xdg_state_home: Some(dir.clone()),
+            ..Env::default()
+        });
+        let env = Env::with_aterm_vars(&[("TERM_PROGRAM", "aterm")]);
+        // Hosted, but no session to locate: the link is absent and says why.
+        let mut link =
+            Link::launch_with(config(), 77, child(Some("1.4.10"), None), 0, lookup(&env));
+        assert!(link.is_absent());
+        journal(&mut link, &log);
+        let text = std::fs::read_to_string(log.path().unwrap()).unwrap();
+        assert!(text.contains(" UNCLAIMED locator "), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

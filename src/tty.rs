@@ -43,6 +43,43 @@ impl fmt::Debug for Mode {
     }
 }
 
+impl Mode {
+    /// The mode as words, to cross the harness's own re-exec ([`crate::adopt`]): the four flag
+    /// sets, the two speeds and the control characters in hex.
+    #[must_use]
+    pub fn words(&self) -> String {
+        let t = &self.0;
+        let cc: String = t.c_cc.iter().map(|b| format!("{b:02x}")).collect();
+        format!(
+            "{} {} {} {} {} {} {cc}",
+            t.c_iflag, t.c_oflag, t.c_cflag, t.c_lflag, t.c_ispeed, t.c_ospeed
+        )
+    }
+
+    /// The mode [`Mode::words`] wrote; `None` for anything else.
+    #[must_use]
+    pub fn from_words(text: &str) -> Option<Mode> {
+        let w: Vec<&str> = text.split(' ').collect();
+        let [iflag, oflag, cflag, lflag, ispeed, ospeed, cc] = w.as_slice() else {
+            return None;
+        };
+        let mut t = blank_termios();
+        t.c_iflag = iflag.parse().ok()?;
+        t.c_oflag = oflag.parse().ok()?;
+        t.c_cflag = cflag.parse().ok()?;
+        t.c_lflag = lflag.parse().ok()?;
+        t.c_ispeed = ispeed.parse().ok()?;
+        t.c_ospeed = ospeed.parse().ok()?;
+        if cc.len() != 2 * t.c_cc.len() || !cc.is_ascii() {
+            return None;
+        }
+        for (slot, i) in t.c_cc.iter_mut().zip((0..cc.len()).step_by(2)) {
+            *slot = u8::from_str_radix(&cc[i..i + 2], 16).ok()?;
+        }
+        Some(Mode(t))
+    }
+}
+
 /// Whether this platform's terminal access time is never earlier than the last read
 /// (measured on macOS only).
 pub const INPUT_CLOCK: bool = cfg!(target_os = "macos");
@@ -104,6 +141,15 @@ impl Tty {
     pub fn set_mode(self, mode: &Mode) -> bool {
         // SAFETY: `mode.0` is a `termios` read from a terminal by `tcgetattr`.
         unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &raw const mode.0) == 0 }
+    }
+
+    /// Drop what was typed on the terminal and not yet read (`tcflush` of the input queue), only
+    /// while this process's group is the terminal's foreground group (a background job's
+    /// `tcflush` would stop it with `SIGTTOU`). Whether the queue was dropped.
+    #[must_use]
+    pub fn discard_input(self) -> bool {
+        // SAFETY: tcflush takes a descriptor and a queue selector and touches no memory of ours.
+        self.foreground() == Some(true) && unsafe { libc::tcflush(self.fd, libc::TCIFLUSH) } == 0
     }
 
     /// Whether this process's group is the terminal's foreground group.

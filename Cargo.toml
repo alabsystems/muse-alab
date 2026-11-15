@@ -2,11 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [workspace]
-members = ["."]
+# The pinned alab-harness copy is its own workspace, never a member of this one. The root
+# package is the only member, with no `members` list: cargo counts every path under a listed
+# member as an explicit member, so `members = ["."]` would void this exclude and make alab-wire
+# inherit this workspace's package table.
+exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Andrew Yates"]
@@ -16,6 +20,51 @@ authors = ["Andrew Yates"]
 # name (atpkg's vendor row already exposes that).
 [workspace.metadata.atpkg]
 expose = ["muse-alab"]
+
+# What a package of main is held to before aterm's tip lane (`atpkg-publish lane run tip`)
+# stages it: the format, lint and test steps of this repository's release gate
+# (publish/config.sh), then the pack itself, then the packed binary's two entry points that
+# never start Muse Code. Each step passes only if it exits 0 within `within-secs`.
+[[workspace.metadata.atpkg.qualify]]
+name = "fmt"
+stage = "source"
+run = ["targo", "fmt", "--check"]
+within-secs = 600
+
+[[workspace.metadata.atpkg.qualify]]
+name = "tippy"
+stage = "source"
+run = ["targo", "tippy", "--locked", "--workspace", "--all-targets", "--", "-D", "warnings"]
+within-secs = 3600
+
+[[workspace.metadata.atpkg.qualify]]
+name = "test"
+stage = "source"
+run = ["targo", "--unverified", "test", "--locked", "--workspace"]
+within-secs = 3600
+min-tests = 90
+
+[[workspace.metadata.atpkg.qualify]]
+name = "build"
+stage = "build"
+within-secs = 3600
+
+[[workspace.metadata.atpkg.qualify]]
+name = "version"
+stage = "packed"
+run = ["{bin}/muse-alab", "--version"]
+within-secs = 120
+
+# The probe a running harness makes of a newer build before it re-execs onto it
+# (src/adopt.rs): exit 0 and exactly the carried-state format's name and version.
+[[workspace.metadata.atpkg.qualify]]
+name = "adopt-probe"
+stage = "packed"
+run = ["/bin/sh", "-c", '''
+out=$("{bin}/muse-alab" --alab-adopt-probe </dev/null) || exit 1
+[ "$out" = "muse-alab-adopt 2" ]
+''']
+within-secs = 120
 
 [package]
 name = "muse-alab"
@@ -35,7 +84,15 @@ name = "muse-alab"
 path = "src/main.rs"
 
 [dependencies]
+# The shared aterm client (alab-harness, crate alab-wire): the vendored copy of alab-harness
+# v0.1.0, pinned by its git tree id in vendor/alab-harness.pin (alab-harness tools/pin; run it
+# again with a newer tag to move). tests/pin.rs holds the copy to the pin.
+alab-wire = { path = "vendor/alab-harness/crates/alab-wire" }
 libc = "0.2"
+
+[dev-dependencies]
+# The fake aterm the integration test runs the harness against, from the same pinned copy.
+alab-wire = { path = "vendor/alab-harness/crates/alab-wire", features = ["fake"] }
 
 [lints.rust]
 missing_docs = "warn"
