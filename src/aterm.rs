@@ -3,20 +3,22 @@
 
 //! muse-alab's side of its link to aterm. The link itself is the shared library `alab-wire`
 //! (`vendor/alab-harness/crates/alab-wire`, the copy of alab-harness pinned in
-//! `vendor/alab-harness.pin`): the wire, the claim at contract 4 or 3 with its guards (the
-//! roster under contract 3, the scope read back), the [`Link`] state machine with its bounds
-//! and its busy-not-gone rule, aterm's exit judgement and the crash ladder. This module holds
-//! only what is this harness's own: who it is to aterm ([`config`]), the clock its link runs on
-//! ([`now_ms`]), what it claims for a child ([`child`]), whether a move may be weighed at all
-//! under the grant ([`upgrade_held`]), aterm's word at a move's act ([`move_unheld`], which adds
-//! Muse Code's composer and person checks to `alab-wire`'s rule for a move a harness judges by
-//! its own readings), and how the link's notes reach the journal ([`journal`]).
+//! `vendor/alab-harness.pin`): the wire, the claim with its guards (the scope read back), the
+//! [`Link`] state machine with its bounds and its busy-not-gone rule, aterm's exit judgement and
+//! the crash ladder. This module holds only what is this harness's own: who it is to aterm
+//! ([`config`], declaring the one contract it claims under, [`CONTRACTS`]), the clock its link
+//! runs on ([`now_ms`]), what it claims for a child ([`child`]), whether a move may be weighed at
+//! all under the grant ([`upgrade_held`]), aterm's word at a move's act ([`move_unheld`], which
+//! adds Muse Code's composer and person checks to `alab-wire`'s rule for a move a harness judges
+//! by its own readings), and how the link's notes reach the journal ([`journal`]).
 
 use std::ffi::OsString;
 use std::time::Duration;
 
 use alab_wire::claim::Human;
-use alab_wire::{Child, ChildProcess, Config, Facts, Link, Reading, SafePoint, Scope, Warrant};
+use alab_wire::{
+    Child, ChildProcess, Config, Contract, Facts, Link, Reading, SafePoint, Scope, Warrant,
+};
 
 use crate::env::Env;
 use crate::gate::{self, Composer, ComposerWitness};
@@ -31,16 +33,32 @@ pub const VENDOR_WORD: &str = "muse";
 /// itself). The typing scopes stay unclaimed: this harness types nothing.
 pub const SCOPES: [Scope; 2] = [Scope::Relaunch, Scope::Upgrade];
 
-/// Who this harness is to aterm.
+/// The contracts this harness declares and claims under: 4 alone, the `contracts` of
+/// `alab-harness.toml` (a unit test holds the two equal). Contract 3 is aterm's compiled seed
+/// rows' alone; a record-bearing build never claims it, and a 3 in the record would keep aterm
+/// serving it (the harness proofs' plan, D11). [`config`] declares them to `alab-wire`
+/// (`Config::with_contracts`, alab-harness Decision 33), whose every claim (the launch, an
+/// adoption, each one made again after a loss or a policy switched back on) keeps to them: an
+/// aterm that serves none of them (`2,3`, or 2 alone) is `Failure::Unserved`, sent no claim and
+/// read again every 5 s.
+pub const CONTRACTS: [Contract; 1] = [Contract::Four];
+
+/// Who this harness is to aterm, declaring [`CONTRACTS`]. It asks for no session stream
+/// (`alab-wire` v0.4.0's, which a contract-4 grant opens by default): taking the stream is its
+/// own package (HX-19), so a contract-4 claim stays on the v0.1 path, renewed with `meta set
+/// supervisor` and woken by the event subscription.
 ///
 /// # Panics
-/// Never: the id and vendor word are fixed lowercase words, [`SCOPES`] is not empty, and the
-/// build refuses a [`crate::HARNESS_VERSION`] that is not `MAJOR.MINOR.0[+g<sha>]`
-/// (`crate::is_pack_version`), which is a claim's `version=`. The unit test makes this config.
+/// Never: the id and vendor word are fixed lowercase words, [`SCOPES`] and [`CONTRACTS`] are
+/// not empty, and the build refuses a [`crate::HARNESS_VERSION`] that is not
+/// `MAJOR.MINOR.0[+g<sha>]` (`crate::is_pack_version`), which is a claim's `version=`. The unit
+/// test makes this config.
 #[must_use]
 pub fn config() -> Config {
     Config::new(HOLDER_ID, VENDOR_WORD, &SCOPES, crate::HARNESS_VERSION)
-        .expect("muse-alab's id, vendor word, scopes and version are a config aterm reads")
+        .and_then(|config| config.with_contracts(&CONTRACTS))
+        .expect("muse-alab's id, vendor, scopes, version and contracts make a config aterm reads")
+        .with_stream(false)
 }
 
 /// `env` as the lookup `alab-wire` reads a session from.
@@ -280,8 +298,8 @@ fn composer_why(word: &str, served: Option<Composer>) -> String {
     }
 }
 
-/// Write the link's notes to the journal: `aterm <verb> <rest>` becomes the event `<VERB>` with
-/// `<rest>` (`aterm claimed holder=… contract=4 …` is `CLAIMED holder=… contract=4 …`).
+/// Write the link's notes to the journal, each `aterm <verb> <detail>` as a `<VERB>` event:
+/// after every step of the link (its launch, an adoption, a tick, an event drain, a read).
 pub fn journal(link: &mut Link, journal: &Journal) {
     for line in link.take_notes() {
         let rest = line.strip_prefix("aterm ").unwrap_or(&line);
@@ -294,6 +312,28 @@ pub fn journal(link: &mut Link, journal: &Journal) {
 mod tests {
     use super::*;
 
+    /// The config declares to `alab-wire` the contracts the record says (`alab-harness.toml`,
+    /// which atpkg-publish copies into the signed manifest): 4 alone.
+    #[test]
+    fn the_record_and_the_claim_name_contract_4_alone() {
+        let record = include_str!("../alab-harness.toml");
+        let line = record
+            .lines()
+            .find(|line| line.split('=').next().map(str::trim) == Some("contracts"))
+            .expect("alab-harness.toml says its contracts");
+        let listed: Vec<u32> = line
+            .split_once('[')
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| list)
+            .expect("a list")
+            .split(',')
+            .map(|n| n.trim().parse().expect("a contract number"))
+            .collect();
+        assert_eq!(listed, CONTRACTS.map(Contract::number));
+        assert_eq!(listed, [4]);
+        assert_eq!(config().contracts(), CONTRACTS);
+    }
+
     #[test]
     fn this_harness_is_muse_alab_claiming_relaunch_and_upgrade() {
         let config = config();
@@ -302,6 +342,7 @@ mod tests {
         assert_eq!(config.scopes(), [Scope::Relaunch, Scope::Upgrade]);
         assert_eq!(config.holder(77), "muse-alab@77");
         assert_eq!(config.version(), crate::HARNESS_VERSION);
+        assert!(!config.streams(), "the session stream is HX-19's");
     }
 
     #[test]
@@ -549,5 +590,121 @@ mod tests {
         let text = std::fs::read_to_string(log.path().unwrap()).unwrap();
         assert!(text.contains(" UNCLAIMED locator "), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whether `verbs` (what the fake aterm was asked) hold a contract-3 claim, or the read-only
+    /// roster check `alab-wire` makes before one alone (`native-act info`), or any claim not at 4.
+    fn any_contract_3(verbs: &[String]) -> bool {
+        verbs.iter().any(|verb| {
+            verb == "native-act info"
+                || (verb.starts_with("meta set supervisor ") && !verb.contains(" contract=4 "))
+        })
+    }
+
+    /// NO CONTRACT-3 CLAIM IS EVER SENT ([`CONTRACTS`], declared to `alab-wire`). An aterm that
+    /// serves `2,3` (aterm main before HX-06) or 2 alone is sent no claim and no contract-3
+    /// roster read, at the launch, at an adoption or on the reclaim clock, and the launch's lost
+    /// link says why (`Failure::Unserved`, on which the launch passes Muse Code through). Once
+    /// aterm serves 4 the claim is made at 4, and a claim lost to an aterm restart into `2,3` is
+    /// made again at 4 alone. NEGATIVE CONTROL: the same scene with `alab-wire`'s default
+    /// contracts (3 and 4) claims at 3.
+    #[test]
+    fn no_contract_3_claim_is_ever_sent() {
+        use alab_wire::Failure;
+        use alab_wire::link::RECLAIM_EVERY_MS;
+
+        let aterm = alab_wire::fake::FakeAterm::for_harness("muse-alab-unit-contracts", &config());
+        let lookup = aterm.lookup(config().env());
+        let me = std::process::id();
+        let muse = || child(Some("1.4.10"), None);
+        let mut ms = 0;
+        for (served, why) in [
+            (&[2, 3][..], "policy contract=2,3 declared=4"),
+            (&[2][..], "policy contract=2 declared=4"),
+        ] {
+            aterm.serve_contracts(served);
+            let mut link = Link::launch_with(config(), me, muse(), ms, &lookup);
+            assert!(link.is_lost() && !link.claims(), "{why}");
+            assert_eq!(link.unclaimed(), Some(&Failure::Unserved(why.to_string())));
+            assert!(
+                link.take_notes()
+                    .contains(&format!("aterm unclaimed {why}")),
+                "{why}"
+            );
+            for _ in 0..3 {
+                ms += RECLAIM_EVERY_MS;
+                link.tick(muse(), ms);
+                assert!(link.is_lost() && link.grant().is_none(), "{why}");
+            }
+            let adopted = Link::adopt_with(config(), me, muse(), ms, &lookup);
+            assert!(adopted.is_lost() && adopted.grant().is_none(), "{why}");
+            assert_eq!(aterm.holder(), None, "{why}");
+        }
+        assert!(!any_contract_3(&aterm.verbs()), "{:?}", aterm.verbs());
+        assert!(
+            !aterm
+                .verbs()
+                .iter()
+                .any(|verb| verb.starts_with("meta set supervisor ")),
+            "no claim at all: {:?}",
+            aterm.verbs()
+        );
+
+        // aterm serves 4: the lost launch is claimed at 4 on the clock.
+        aterm.serve_contracts(&[2, 3]);
+        let mut link = Link::launch_with(config(), me, muse(), ms, &lookup);
+        aterm.serve_contracts(&[2, 3, 4]);
+        ms += RECLAIM_EVERY_MS;
+        link.tick(muse(), ms);
+        assert_eq!(
+            link.grant().map(|grant| grant.contract),
+            Some(Contract::Four),
+            "{:?}",
+            link.take_notes()
+        );
+        assert_eq!(aterm.holder(), Some(format!("muse-alab@{me}")));
+
+        // aterm restarts into one serving `2,3`: the claim is made again at 4 alone.
+        aterm.restart();
+        aterm.serve_contracts(&[2, 3]);
+        let _ = link.relaunch_word(false, ms);
+        assert!(link.is_lost() && link.claims(), "{:?}", link.take_notes());
+        for _ in 0..3 {
+            ms += RECLAIM_EVERY_MS;
+            link.tick(muse(), ms);
+            assert!(link.is_lost() && link.grant().is_none());
+        }
+        assert_eq!(
+            link.unclaimed(),
+            Some(&Failure::Unserved(
+                "policy contract=2,3 declared=4".to_string()
+            ))
+        );
+        assert_eq!(aterm.holder(), None);
+        aterm.serve_contracts(&[2, 3, 4]);
+        ms += RECLAIM_EVERY_MS;
+        link.tick(muse(), ms);
+        assert_eq!(
+            link.grant().map(|grant| grant.contract),
+            Some(Contract::Four),
+            "{:?}",
+            link.take_notes()
+        );
+        link.release(ms);
+        let verbs = aterm.verbs();
+        assert!(!any_contract_3(&verbs), "{verbs:?}");
+
+        // NEGATIVE CONTROL: the default contracts claim at 3 from the same `2,3` aterm.
+        aterm.serve_contracts(&[2, 3]);
+        let both = Config::new(HOLDER_ID, VENDOR_WORD, &SCOPES, crate::HARNESS_VERSION)
+            .unwrap()
+            .with_stream(false);
+        let mut three = Link::launch_with(both, me, muse(), ms, &lookup);
+        assert_eq!(
+            three.grant().map(|grant| grant.contract),
+            Some(Contract::Three)
+        );
+        three.release(ms);
+        assert!(any_contract_3(&aterm.verbs()[verbs.len()..]));
     }
 }

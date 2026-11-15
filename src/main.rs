@@ -5,10 +5,15 @@
 //!
 //! - `muse-alab --version` (the only argument) prints the harness's version and the
 //!   installed vendor build's.
+//! - `muse-alab run -- <muse arguments>` is atpkg's launcher handing the word `muse` to the
+//!   harness: the launcher's blocks for `muse` run first, in its order ([`muse_alab::launcher`]:
+//!   the yolo default, printed on stderr as the launcher prints it), then Muse Code runs as
+//!   below. A `run` without that `--` is refused (exit 2).
 //! - `muse-alab --no-harness …` (or `ATERM_NO_HARNESS=1`) runs the store's `muse`
-//!   directly, replacing this process: no supervision at all.
+//!   directly, replacing this process: no supervision at all. Under `run --` the launcher's
+//!   blocks still run first, as the launcher runs them for `muse --no-harness`.
 //! - Under aterm the harness supervises under a claim of both its duties (`alab-wire`, contract
-//!   4 or 3, [`muse_alab::aterm`]), held or still being made, and otherwise runs the store's
+//!   4 alone, [`muse_alab::aterm`]), held or still being made, and otherwise runs the store's
 //!   `muse` in its place the same way.
 //! - Every other argument is passed to `muse` unchanged.
 //! - `--alab-adopt <fd>` is this harness's own re-exec onto a newer build of itself, and
@@ -23,10 +28,11 @@ use std::ffi::OsString;
 use std::io::Write as _;
 use std::os::unix::process::CommandExt as _;
 
-use alab_wire::Link;
+use alab_wire::{Failure, Link};
 use muse_alab::adopt;
 use muse_alab::aterm;
 use muse_alab::env::{Env, PARENT_VAR, nesting_depth, started_as_vendor, strip_no_harness};
+use muse_alab::launcher::{self, Command};
 use muse_alab::muse::{PACKAGE, PRODUCT, PROGRAM, argv};
 use muse_alab::store;
 use muse_alab::supervise::{Config, Harness};
@@ -41,6 +47,9 @@ const CANNOT_RUN: i32 = 126;
 
 /// The exit status when a re-exec'd image cannot take its child over.
 const NO_ADOPTION: i32 = 70;
+
+/// The exit status of a command line no caller writes (a `run` without the launcher's `--`).
+const USAGE: i32 = 2;
 
 fn main() {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -82,7 +91,26 @@ fn main() {
         let _ = writeln!(std::io::stdout(), "{line}");
         return;
     }
-    let (no_harness_word, args) = strip_no_harness(args);
+    let (off, args) = match launcher::read(args) {
+        Ok(Command::Direct(args)) => {
+            let (word, args) = strip_no_harness(args);
+            (word || env.no_harness, args)
+        }
+        Ok(Command::Run(args)) => {
+            // The launcher's blocks run whether or not the harness then supervises, as the
+            // launcher runs its yolo block after its `--no-harness` strip and before it reads
+            // `ATERM_NO_HARNESS` (aterm `platform/mod.rs:1109-1123`, 672): turning the harness
+            // off skips only the harness.
+            let (word, args) = strip_no_harness(args);
+            let launch = launcher::yolo(args);
+            if let Some(line) = &launch.echo {
+                // As the launcher's `printf`: a closed or broken stderr stops nothing.
+                let _ = std::io::stderr().write_all(line);
+            }
+            (word || env.no_harness, launch.args)
+        }
+        Err(why) => refuse(USAGE, &why),
+    };
     let layout = match store::resolve(&env) {
         Ok(l) => l,
         Err(e) => refuse(
@@ -98,16 +126,16 @@ fn main() {
             &format!("{e}. Install it with `aterm pkg install {PACKAGE}`."),
         ),
     };
-    if no_harness_word || env.no_harness {
+    if off {
         pass_through(&harness, &build, &args);
     }
     // Under aterm: the start sequence of aterm's harness design §3.2, through alab-wire, to a
     // claim of both duties, or Muse Code in this process's place (a launch that is not the
-    // interactive TUI, no session to locate, no roster row under contract 3, a claim aterm did
-    // not prove or refused, or a grant of less than both duties, which is given back). An
-    // aterm that answered the handshake and then answered late or `ERR` (a dialog up, a stall),
-    // serves no contract this harness claims at, or has its policy switched off is busy or off
-    // for now, not away: Muse Code runs supervised and the claim is made again every 5 s.
+    // interactive TUI, no session to locate, an aterm that serves no contract this harness
+    // claims at, a claim aterm did not prove or refused, or a grant of less than both duties,
+    // which is given back). An aterm that answered the handshake and then answered late or `ERR`
+    // (a dialog up, a stall), or has its policy switched off, is busy or off for now, not away:
+    // Muse Code runs supervised and the claim is made again every 5 s.
     let link = if aterm::hosted(&env, &aterm::config()) {
         match start_under_aterm(&harness, &env, &build, &args) {
             Ok(link) => link,
@@ -174,6 +202,14 @@ fn start_under_aterm(
     aterm::journal(&mut link, harness.journal());
     if link.is_absent() {
         return Err("aterm holds no claim of this harness's (the UNCLAIMED line says why)".into());
+    }
+    // An aterm that serves no contract this harness declares (`2,3`, aterm main before HX-06, or
+    // 2 alone) was sent no claim: Muse Code runs in the harness's place, the tab left to aterm's
+    // built-in Muse Code lanes, which serve that aterm. Nothing was claimed to give back.
+    if let Some(Failure::Unserved(why)) = link.unclaimed() {
+        return Err(format!(
+            "aterm serves no contract this harness claims at ({why})"
+        ));
     }
     if link.judges() && !aterm::takes_both(&link) {
         let granted = aterm::granted(&link);

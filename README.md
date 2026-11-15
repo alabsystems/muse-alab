@@ -17,21 +17,66 @@ muse-alab <version> (muse <vendor version>)
 
 It is opt-in and changes nothing for anyone who does not run it: no configuration file, no
 environment knob of its own (release builds), nothing written to the terminal while Muse
-Code runs, and no change to `muse` itself. The only variables it sets are its recursion
+Code runs (under `run --`, the launcher's one yolo line before it starts, below), and no change
+to `muse` itself. The only variables it sets are its recursion
 guard's two marks on the processes it starts as Muse Code (below).
 
 ## Use
 
 ```sh
-aterm pkg install muse        # the vendor CLI, into aterm's package store
-muse-alab [muse arguments…]   # Muse Code, under the harness
-muse-alab --version           # the harness's version and the installed Muse Code build
-muse-alab --no-harness …      # Muse Code from the store, replacing this process (no harness)
+aterm pkg install muse             # the vendor CLI, into aterm's package store
+muse-alab [muse arguments…]        # Muse Code, under the harness
+muse-alab run -- [muse arguments…] # the launcher's yolo default, then Muse Code as above (below)
+muse-alab --version                # the harness's version and the installed Muse Code build
+muse-alab --no-harness …           # Muse Code from the store, replacing this process
 ```
 
 `--no-harness` (or `--no-alab-harness`, before a literal `--`) and `ATERM_NO_HARNESS=1` —
 the opt-out aterm's `agents/` twin already uses — run the store's `muse` in place of the
-harness with the remaining arguments, so nothing is supervised.
+harness with the remaining arguments (under `run --`, the arguments the launcher's blocks left;
+below), so nothing is supervised.
+
+### Run by atpkg's launcher: `run --`
+
+Once this harness's record leads the word `muse` (`leads` in `alab-harness.toml`, still empty
+until its `lab harness-proof` passes against the real Muse Code), atpkg's launcher for `muse`
+keeps only its check that a live build of the harness is installed and then runs
+`exec <prefix>/bin/muse-alab run -- "$@"` (aterm's harness interface design §2.1, "The launcher
+keeps its other duties"; aterm `crates/atpkg/src/platform/mod.rs:659-690`). Every word after that
+`--` is Muse Code's. The launcher's other blocks for `muse` move into `run`, which runs them in
+the launcher's order, in its own process, before Muse Code starts (`src/launcher.rs`, citing the
+aterm source of each):
+
+- **the self-update intercept**: none. The muse row names no self-update verb, so the launcher
+  has no such block and `muse-alab run -- update` hands `update` to Muse Code, as `muse update`
+  does today;
+- **the sign-in gate**: none. The muse row has none;
+- **the yolo default**, byte for byte: with nothing typed ahead of a literal `--` that decides the
+  posture, Muse Code starts with `--disable-approval --disable-sandbox --trust-workspace
+  --disable-request-user-input`, in front, or right behind a first word `exec`; a typed `--yolo`
+  spells the same in its place; a posture flag of Muse Code's own (`--approval-mode`, `-c`, …),
+  a first word that takes none (`resume`, `skills`, `login`, …), an option the launcher's scan
+  does not know ahead of the first word, or `--model` with no value runs as typed. Before Muse
+  Code starts, stderr carries the launcher's own line, e.g.
+  `aterm: yolo (default): running 'muse' '--disable-approval' '--disable-sandbox'
+  '--trust-workspace' '--disable-request-user-input'` (`aterm: --yolo: running …` for a typed
+  `--yolo`). `tests/fixtures/atpkg-muse-yolo.sh` is the launcher's block as atpkg lays it, and a
+  unit test holds the harness to it on 22,027 argvs under `/bin/sh`, bash and dash, among them
+  every argv of one or two words over every word the block names, each spelled out in the test
+  rather than taken from the harness's own tables (another test holds that list to the block's
+  `case` patterns);
+- **the shim's environment**: none. The muse row sets no variable, and the harness runs Muse Code
+  from its store build, never through atpkg's shim.
+
+These run whether or not the harness then supervises: a `run` that is handed `--no-harness`
+(stripped first, as the launcher strips it), or runs under `ATERM_NO_HARNESS`, still gets the
+yolo default and its line, and then the store's `muse` runs in the harness's place with the
+arguments the block left. That is what the launcher does today: its `--no-harness` only sets
+`ATERM_NO_HARNESS=1` and its yolo block runs all the same (aterm
+`platform/mod_sh_shim_tests.rs:790-793`), so turning the harness off skips the supervision and
+nothing else. A `run` without the launcher's `--` is refused with exit 2: no launcher writes it,
+and Muse Code has no `run` of its own. `muse-alab` typed by its own name runs no launcher block,
+as before.
 
 ## What it does
 
@@ -167,32 +212,36 @@ resume and everything else still work).
 
 In an aterm tab (`TERM_PROGRAM=aterm`, `ATERM_CHILD=1` or a set `ATERM_SESSION_ID`) the harness
 links to aterm through `alab-wire`, the ALab harnesses' shared aterm client
-(`vendor/alab-harness/crates/alab-wire`, the vendored copy of alab-harness `v0.1.0`, pinned by
+(`vendor/alab-harness/crates/alab-wire`, the vendored copy of alab-harness `v0.7.1`, pinned by
 its git tree id in `vendor/alab-harness.pin`; see Decisions). `src/aterm.rs` holds only what is
-this harness's own: who it is (`muse-alab`, vendor `muse`, duties `relaunch,upgrade`), the clock
-its link runs on (one that stops while the Mac sleeps), what it claims for a child, aterm's word
-on a move, and how the link's notes reach the journal. The start sequence (aterm's harness design,
+this harness's own: who it is (`muse-alab`, vendor `muse`, duties `relaunch,upgrade`, contract 4
+alone), the clock its link runs on (one that stops while the Mac sleeps), what it claims for a
+child, aterm's word on a move, and how the link's notes reach the journal. The start sequence (aterm's harness design,
 `docs/DESIGN-harness-repos-2026-10-24.md` §3.2, §8, and its interface design §2.2):
 
 1. It finds the tab's control socket (`ATERM_PARENT_SESSION_ID`, the rendezvous directory's
    `graph/<sid>`, the token beside the socket) and reads `harness policy`.
-2. It claims both duties at the highest contract both sides speak: `meta set supervisor
+2. It claims both duties at contract 4, the only contract it claims under (`contracts = [4]`
+   in `alab-harness.toml`, `CONTRACTS` in `src/aterm.rs`): `meta set supervisor
    muse-alab@<pid> contract=4 scope=relaunch,upgrade version=<version> vendor=<vendor version>`,
-   whose reply is aterm's grant; under contract 3, only once aterm's read-only `native-act info`
-   names `muse-alab:upgrade` in its `own-image=` roster rows, and read back with `status`
-   (`supervisor_proven=1`, a `supervisor_scope=` taking both). After every child start (the
-   first included) it announces the claim again with the child it now runs (`vendor=`, and
-   `child=<pid>:<kernel start>` under contract 4), so aterm can tell this child from the next.
+   whose reply is aterm's grant, read back with `status` (`supervisor_proven=1`, a
+   `supervisor_scope=` taking both). After every child start (the first included) it announces
+   the claim again with the child it now runs (`vendor=`, and `child=<pid>:<kernel start>`), so
+   aterm can tell this child from the next. It never claims contract 3: it declares 4 alone to
+   `alab-wire` (`Config::with_contracts`), whose every claim keeps to it, so an aterm whose
+   policy lists no 4 is sent no claim at the launch (below), nor later: a launch whose first
+   read went unanswered, or a claim lost to an aterm restart into one serving `2,3`, is claimed
+   at 4 once aterm serves it and not before (`UNCLAIMED policy contract=2,3 declared=4`).
 3. Where aterm refuses — a launch that is not Muse Code's interactive TUI, no session to locate,
-   no socket that answers, a window that cannot host a harness (`why=unhosted`), no registry
-   row that proves the holder, no roster row under contract 3, a claim aterm did not prove, or
-   a grant of less than both duties (given back) — the harness gets out of the way: it `exec`s
-   the store's `muse` in its own place, and the tab runs Muse Code under its own name,
-   supervised by aterm's built-in Muse Code lanes as if no harness existed (`UNCLAIMED`, then
-   `PASS`). An aterm that is busy (it answered the handshake and then late, or `ERR` while it
-   shows a dialog), switched off for now (`autopilot-off`, `disabled`, `agent-off`) or serving no
-   contract this harness claims at is not away: Muse Code runs as the harness's child and the
-   claim is made every 5 s until aterm admits it (`UNCLAIMED`, then `CLAIMED`).
+   no socket that answers, a window that cannot host a harness (`why=unhosted`), a policy that
+   serves no contract 4 (`2,3`, aterm main before HX-06, or 2 alone), no registry row that
+   proves the holder, a claim aterm did not prove, or a grant of less than both duties (given
+   back) — the harness gets out of the way: it `exec`s the store's `muse` in its own place, and
+   the tab runs Muse Code under its own name, supervised by aterm's built-in Muse Code lanes as
+   if no harness existed (`UNCLAIMED`, then `PASS`). An aterm that is busy (it answered the handshake and then late, or `ERR` while it
+   shows a dialog) or switched off for now (`autopilot-off`, `disabled`, `agent-off`) is not
+   away: Muse Code runs as the harness's child and the claim is made every 5 s until aterm
+   admits it (`UNCLAIMED`, then `CLAIMED`).
 
 The launch gives each socket operation 2 s; every exchange from the supervisor's loop gives aterm
 at most 500 ms. The claim follows aterm's policy and events from then on (`alab-wire`'s
@@ -209,9 +258,12 @@ once its connection fails (`LOST`), as when aterm restarts.
   harness leads no built-in lane of aterm's brings the child back, so a crash passed on at once
   would leave the session to nobody. Past it the crash is passed on (`NO-RELAUNCH
   claim-not-proven-again`). The wait sleeps between its asks. In a tab where aterm never admitted
-  a claim of this harness's (busy, off for now or not serving its contract at the launch, or
+  a claim of this harness's (busy or off for now at the launch, not serving its contract or
   refused since), the crash is passed on at once (`NO-RELAUNCH no-claim`): aterm never let the
-  harness lead the tab, so there is no lost claim to wait for. Keys typed at the dead screen
+  harness lead the tab, so there is no lost claim to wait for. A lost link whose claim made
+  again aterm answered serving no contract this harness declares (`2,3` after an aterm restart)
+  is not away either: that answer is aterm's last word on the link, and the crash is passed on
+  at once (`NO-RELAUNCH aterm's word: policy contract=2,3 declared=4`). Keys typed at the dead screen
   while a crash waits are dropped before the relaunched child starts or the crash is passed on,
   so they reach neither the resumed Muse Code nor the parent shell.
 - **A restart aterm asks for** (`restart cause=asked`, a person's `aterm ctl restart`, or
@@ -327,7 +379,7 @@ order against and never re-execs. The journal says `REEXEC` (old image) and `ADO
   relaunches per ten minutes was replaced on 2026-11-14, below); a clean `session.end` in the
   child's own log part vetoes it, and nothing ever causes one.
 - **The journal is a file, never the terminal**; the only terminal output is one line before
-  a relaunch and the refusals.
+  a relaunch, the refusals, and under `run --` the launcher's yolo line before Muse Code starts.
 - **No `harness.json`, no environment knobs.** A harness file would advertise a contract
   this release does not speak. Debug builds read `MUSE_ALAB_TEST_TIMING` so the tests run in
   seconds (`<tick>,<look>,<person grace>,<settle>,<stop wait>[,<away budget>]` ms; the stop
@@ -454,8 +506,11 @@ order against and never re-execs. The journal says `REEXEC` (old image) and `ADO
   row, so the launch passes through. After the claim, `status` must name this harness, proven,
   with a `supervisor_scope=` that takes every duty claimed; anything less is let go and passed
   through, and an act whose fresh read finds the claim no longer taking its duty treats the claim
-  as lost and makes it again. (Since 2026-11-14 `alab-wire` makes the claim, this guard
-  included, at contract 4 where aterm serves it; below.)
+  as lost and makes it again. (Since 2026-11-14 `alab-wire` makes the claim, and this harness
+  claims at contract 4 alone, where `alab-wire` asks no roster: aterm's proof reads the registry
+  row instead. The roster guard is contract 3's, so this harness never reaches it: since
+  alab-harness `v0.7.0` `alab-wire` makes it no contract-3 claim at all; see "The contracts
+  are declared to `alab-wire`", below.)
 - **aterm's silence never holds the loop, and a busy aterm is not an absent one** (2026-11-13;
   kimi-alab 0dd6fe6, claude-code-alab's `CONNECT_TIMEOUT`/`REQUEST_TIMEOUT`). The loop that reaps
   the child and passes on its signals used to wait up to 5 s per socket operation on aterm, a
@@ -485,7 +540,9 @@ order against and never re-execs. The journal says `REEXEC` (old image) and `ADO
   which ends both, and the claim is made again on a new one (`LOST`). Before, the loop kept that
   connection as a given-back claim and its next request read the release's reply. (On
   2026-11-14 a policy switched off and a contract this harness does not claim at stopped being
-  refusals too; below.)
+  refusals too; below. The same day an aterm serving 3 and not 4 became one again at the
+  launch, since this harness claims 4 alone, and with alab-harness `v0.7.0` so did one serving
+  2 alone; see "The contracts are declared to `alab-wire`", below.)
 - **Time stopped is not grace** (2026-11-13; kimi-alab 0dd6fe6 `Reap::Continued`). The 15 s a
   child has to end after the harness's `SIGTERM` runs on std's `Instant`, which on macOS stops
   while the machine sleeps, and starts again whenever the child is continued, since a stopped
@@ -533,12 +590,145 @@ order against and never re-execs. The journal says `REEXEC` (old image) and `ADO
   `publish/manifest.txt` lists `vendor`, so a public clone builds alone. To move to a newer tag
   (a `v0.1.x` fixing what HX-06's measurement finds), run `tools/pin` again and commit; the copy
   is never edited here, and a fault in it is fixed in alab-harness and taken as a new tag.
+  (The copy is `v0.7.1` since the entry "alab-harness `v0.7.0`, with the session stream off",
+  below, and its last line.)
 - **`alab-harness.toml` restates aterm's seed row for this harness** (2026-11-14; aterm tracker
   HX-RECORDS-RESTATE-SEEDS). The record aterm's registry reads from the signed package manifest
   says what aterm's compiled seed row already says: id and tool `muse-alab`, no vendor command it
-  leads, contracts 3 and 4, name `Muse Code`, and no environment prefixes to strip (aterm's
-  default strip list holds no Muse prefix, and a record never widens it). A build carrying the
-  record so changes nothing when its row replaces the seed. It ships in the public snapshot.
+  leads, name `Muse Code`, and no environment prefixes to strip (aterm's default strip list holds
+  no Muse prefix, and a record never widens it). Its contracts, 3 and 4 then, are 4 alone since
+  the entry below. It ships in the public snapshot.
+- **The harness claims contract 4 alone, never 3** (2026-11-14; the harness proofs' plan, D11:
+  "Every harness declares `contracts = [4]`. A record-bearing build never claims 3"). Contract 3
+  is aterm's compiled seed rows' alone (aterm's interface design §2.2: `read_v3` refuses a row a
+  verified record or a link makes), and a 3 in this harness's record would keep aterm serving
+  contract 3 for it once aterm stops serving a contract no installed build claims (HX-22). So
+  `alab-harness.toml` says `contracts = [4]`, and the claim is held to the same list
+  (`aterm::CONTRACTS`; a unit test reads the record and compares). `alab-wire` v0.1.0 builds the
+  contract a claim names itself, the highest both sides list (`Contract::SPOKEN`, 4 then 3), and
+  takes no list from a harness; its pinned copy is never edited here. Against every aterm that
+  serves 4 it claims 4 and nothing changes. Against one that serves 3 and not 4 (aterm main
+  before HX-06 serves `2,3`) the harness reads `harness policy` once itself before the claim and
+  passes Muse Code through with no claim sent, so aterm's built-in Muse Code lanes keep the tab,
+  as for any refusal; where that read goes unanswered, or a lost link is claimed again from an
+  aterm that has stopped serving 4, `alab-wire` can still claim at 3, and the harness gives that
+  claim back at once and closes the link for the session (a closed link in an aterm tab holds
+  every move and passes every crash on, so no duty is done under it). The guard goes once
+  `alab-wire` takes the harness's list (an alab-harness change, taken here as a new pin).
+  (alab-harness `v0.7.0` closed that gap, and the guard is gone; see "The contracts are
+  declared to `alab-wire`", below.)
+- **alab-harness `v0.7.0`, with the session stream off** (2026-11-14). The copy moved from
+  `v0.1.0` to `v0.7.0` (tree `e4c1f87`) for `Config::with_contracts` (alab-harness Decision 33,
+  next entries). The tags between bring the session stream's records and client (`v0.3.0`,
+  `v0.4.0`), the relaunch grammar (`v0.4.0`), `alab-policy` (`v0.2.0`, `v0.5.0`), the re-exec
+  module (`v0.6.0`), and on the v0.1 path this harness runs on the give-back of a contract-4
+  claim aterm may still keep for 45 s after its connection closed (alab-harness Decision 30:
+  `Link::release` on a lost link, and a claim attempt aterm refuses inside that grace, send
+  `meta unset supervisor`). From `v0.4.0` a contract-4
+  grant opens the session stream unless the config says otherwise; this harness says
+  `Config::with_stream(false)` (`aterm::config`), so its claim stays on the v0.1 path, renewed
+  with `meta set supervisor` and woken by the event subscription, as it was: taking the stream
+  is its own package (HX-19). It takes neither `alab-policy` nor the shared re-exec here: its
+  own re-exec (`src/adopt.rs`, protocol 2) stays until the package that moves it onto
+  `alab_wire::reexec`. `Policy::contract` now takes the declared contracts; its one caller
+  here, the launch's own contract read, passed `Contract::SPOKEN` to keep its meaning until the
+  next entry deleted that read.
+  `v0.7.1` (tree `f336fe1`) followed the same day: no library change, three `alab-wire` test
+  races fixed, and `docs/HX-06-aterm-map-2026-11-13.md`, a planning page the copy shipped, gone.
+- **The contracts are declared to `alab-wire`, and the harness's own guard is gone**
+  (2026-11-14; alab-harness `v0.7.0`, its Decision 33, aterm tracker HX-08b). `alab-wire`
+  `v0.7.0` takes the contracts a harness declares (`Config::with_contracts`) and keeps every
+  claim to them: the launch, an adoption, each claim made again after a loss and one after a
+  policy switched back on. An aterm that serves none of them is `Failure::Unserved` (`policy
+  contract=<served> declared=4`), sent no claim and read again every 5 s, and `Link::unclaimed`
+  gives a lost link's last answer. That closes the gap "The harness claims contract 4 alone"
+  (above) worked around, so `aterm::config` declares `CONTRACTS` (`[4]`, still held equal to
+  the record by its unit test) and the workaround is deleted: `aterm::unserved`, the launch's
+  own `harness policy` read before the claim, and the give-back in `aterm::settle`, which
+  released a claim found at 3 after any link step and closed the link for the session
+  (`RELEASED contract=3 …`). `settle` is `aterm::journal` again and only writes the link's
+  notes. What stays and what changes:
+  - No claim at 3 is ever sent. Before, `alab-wire` made one where the launch's own read could
+    not see it coming (a launch whose read went unanswered and then found `2,3`, or a claim
+    lost to an aterm restart into `2,3`) and the harness gave it back; now none is made.
+  - An aterm whose policy at the launch serves no 4 passes Muse Code through, as one serving
+    `2,3` did: `start_under_aterm` reads `Failure::Unserved` from `Link::unclaimed` (nothing
+    was claimed, so nothing is given back), and the tab is left to aterm's built-in Muse Code
+    lanes. One serving 2 alone now passes through too, where since the port it kept Muse Code
+    supervised. `alab-wire` answers the two alike, the same built-in lanes take either tab, and
+    telling them apart would mean reading `alab-wire`'s journal text. "The harness claims
+    contract 4 alone" split them only because keeping the child under `2,3` meant a contract-3
+    claim, a reason that went with the gap. Main passed 2 alone through before the port, and
+    agy-alab passes through on `Failure::Unserved` at launch. An aterm updated to serve 4 during
+    such a session is taken up at the next launch, as the `2,3` case already was.
+  - After the launch, a link that finds no 4 (a busy launch answered `2,3` later, or a claim
+    lost to an aterm restart into `2,3`) stays lost and is claimed at 4 once aterm serves it,
+    where before the given-back claim closed the link for the session and nothing was claimed
+    again. Meanwhile every move holds (`no-claim`); a crash on a link that never held a claim
+    is passed on at once, and so is one on a link that lost its claim once aterm has answered a
+    claim made again that it serves no 4 (`NO-RELAUNCH aterm's word: policy contract=2,3
+    declared=4`; see "A crash once aterm serves no 4 is passed on at once", below).
+  - Tests: the unit test `no_contract_3_claim_is_ever_sent`, against `alab-wire`'s fake (a
+    launch, its reclaims and an adoption against `2,3` and against 2 alone send no claim and no
+    roster read; the claim is made at 4 once served and again at 4 alone after a restart into
+    `2,3`; `alab-wire`'s default contracts claim at 3 in the same scene, as the control),
+    replaces `the_claim_is_held_to_contract_4`; the integration test
+    `under_aterm_no_contract_3_claim_is_ever_sent` (a busy launch answered `2,3`, then a
+    restart into `2,3`, each claimed at 4 only once served) replaces
+    `under_aterm_a_contract_3_claim_is_given_back_at_once`; and the pass-through test's
+    contract cases are `2,3` and 2 alone, the second moved from the busy-or-off test.
+- **A crash once aterm serves no 4 is passed on at once** (2026-11-14, from the review of the
+  entry above, 9b4ecfc). With the guard gone, a claim at 4 lost to an aterm restart into one
+  serving `2,3` leaves the link lost and claimed (`Link::claims`), so a crash went to the crash
+  wait, where `relaunch_word` answers every lost link `Away`. It waited the whole 45 s away
+  budget, journalled `CRASH-WAIT aterm did not answer (link-lost)` and then `NO-RELAUNCH
+  claim-not-proven-again link-lost: aterm did not answer within 45000 ms`, though aterm
+  answered `policy contract=2,3 declared=4` every 5 s: the fault that "In an aterm tab, a link
+  that never held a claim moves nothing and relaunches nothing" fixed for an `off` answer on a
+  link that never claimed. Before,
+  that scene closed the link and the crash was passed on at once (`NO-RELAUNCH no-claim`). The
+  crash wait now reads `Link::unclaimed` when aterm's word is `Away`: `Failure::Unserved` is
+  aterm's last word on a lost link (no hold it stated stands over it, in `alab-wire`'s own
+  words), and no claim can be made until an aterm update, which comes as another restart, so
+  the crash is passed on at once (`NO-RELAUNCH aterm's word: policy contract=2,3 declared=4`).
+  A crash in the 5 s after the loss, before any claim was made again, waits until the wait's
+  own reclaim brings that answer, then is passed on. A refused or `off` answer to a claim made
+  again keeps the wait, unchanged here: the away tests read a refusal of a link that held a
+  claim (no registry row proving it yet) as aterm not yet back, and `alab-wire` keeps such a
+  link lost and claims it again, unlike one that never claimed. A policy-off release had no
+  such fault: its link stays held with no standing claim, which `relaunch_word` denies
+  (`no-claim`). Test: `under_aterm_a_crash_once_aterm_serves_no_4_is_passed_on_at_once` (a
+  crash after aterm's `2,3` answer and one before it; with the check removed the harness does
+  not exit within the test's 30 s).
+- **`run` does what atpkg's launcher did for `muse`** (2026-11-14; aterm harness interface design
+  §2.1, package HX-13a). The launcher will hand the word to this harness as `run -- "$@"`, so
+  `run` takes exactly that form: a first word `run` is always the harness's (Muse Code has no
+  `run`), and one without the `--` right after it is refused with exit 2 rather than guessed at,
+  since no launcher writes it. Of the launcher's blocks for `muse` only the yolo default exists
+  (the row has no self-update verb, no sign-in gate and no shim variable), and it is carried
+  byte for byte from the launcher's shell block, not from atpkg's Rust `yolo::decide`: the two
+  differ where a flag of the default is typed in its `=value` form after the first word
+  (`exec --disable-approval=1`), on which the block adds the flags and `decide` runs as typed,
+  and the block is what the launcher runs. The differential test against the laid block found
+  that difference. The block runs after the recursion guards, which refuse before anything
+  else, and before the store is read, as the launcher prints its line before it execs. A `run`
+  with the harness turned off (`--no-harness`, `ATERM_NO_HARNESS`) runs the blocks all the same
+  and then passes Muse Code through with the arguments they left: the launcher's `--no-harness`
+  only sets `ATERM_NO_HARNESS=1`, and its yolo block runs regardless (aterm
+  `platform/mod_sh_shim_tests.rs:790-793`). The design's list says the default stands "unless
+  the launch says `--no-harness`", but the launcher's code is what a launch gets today, and the
+  design's own "`--no-harness` gets its own variable, which skips only the harness" agrees with
+  it. The launcher hands off every `ATERM_NO_HARNESS` but `1`, which this harness reads as off,
+  so `ATERM_NO_HARNESS=true muse` would otherwise have lost the default once atpkg drops its
+  block (the review of e99d64b found it; this branch's first commit ran no block when off).
+  `muse --no-harness` itself never reaches `run` (the launcher sets the variable and runs Muse
+  Code), so it keeps the default only if atpkg, when it drops its block, hands such a launch to
+  `run` as well, which then runs the block and passes through; that is aterm's half to decide.
+  `muse-alab` typed by its own name runs no block, as before: the blocks belong to the
+  word `muse`. While atpkg still carries its block (until the signed index pins the release that
+  ships this one, and aterm deletes it), the harness sees a launch the block already decided, and
+  the flags it added are posture markers, so nothing is applied twice; the unit test checks that
+  on every argv of its corpus.
 - **A crash follows aterm's ladder, not a budget of three in ten minutes** (2026-11-14). The
   pauses are aterm's own (`alab_wire::relaunch::Ladder`: 1 s, 10 s, 60 s, then 10 min; a child
   that ran 10 minutes since its last crash relaunch starts over), so a crash loop slows to one
@@ -588,7 +778,19 @@ order against and never re-execs. The journal says `REEXEC` (old image) and `ADO
   aterm admits once it is on. Only what no later read can change passes through: a launch that
   is not the TUI, an unhosted or headless window, no registry row or roster row, a claim aterm
   did not prove, and a grant of less than both duties (given back at once, so aterm's built-in
-  engine keeps the duty the grant left out).
+  engine keeps the duty the grant left out). Since "The harness claims contract 4 alone"
+  (above) one more passes through though a later read could change it: an aterm whose
+  `harness policy` at the launch serves 3 and not 4 (aterm main's `2,3`). Kept as the child,
+  Muse Code would gain nothing: the claim `alab-wire` makes there is at 3, which the harness
+  gives back at once, closing the link for the session, while passing through leaves the tab to
+  aterm's built-in Muse Code lanes, which serve that aterm. An aterm updated to serve 4 during
+  the session is therefore taken up only at the next launch. "Not serving this harness's
+  contract" in this entry's title is now an aterm serving no contract `alab-wire` speaks (2
+  alone); a contract-3 claim made later in the session (a lost link claimed again from an aterm
+  that stopped serving 4) is given back and closes the link for the rest of the session, as that
+  entry says. (With alab-harness `v0.7.0` an aterm serving 2 alone at the launch passes through
+  as well, and no contract-3 claim is made later; see "The contracts are declared to
+  `alab-wire`", above.)
 - **The adopt state is protocol 2, with no reading of protocol 1** (2026-11-14). It carries the
   ladder (`ladder <streak> <since ms|->`) and whether the old image had a link (`link
   claims|absent`) where protocol 1 carried crash times and aterm's socket directory and session;
@@ -612,7 +814,9 @@ order against and never re-execs. The journal says `REEXEC` (old image) and `ADO
   passes on a crash on `!claims()`. An aterm serving contract 2 alone still runs Muse Code
   supervised (the entry above), so its crashes are passed on by this harness where main passed
   the launch through to aterm's built-in Muse Code lane; whether that lane brings the tab back
-  after the harness ends is aterm's to say and was not measured here.
+  after the harness ends is aterm's to say and was not measured here. (Since alab-harness
+  `v0.7.0` such a launch passes through again, as main's did; see "The contracts are declared
+  to `alab-wire`", above.)
 - **The crash wait sleeps until its next ask** (2026-11-14, same review). Each pass's wait was
   capped at the ladder's pause even after the pause was over, so with aterm away (asked again
   each second) it waited zero and spun until aterm came back, up to 45 s: the review measured
@@ -650,11 +854,13 @@ under `--no-harness`). Its aterm is `alab-wire`'s fake (`alab_wire::fake::FakeAt
 dev-dependency's `fake` feature), the one kimi-alab and agy-alab test against, answering real
 aterm's shapes on a private socket. Against it the tests cover: the pass-through where no claim
 is proven (no socket, no registry or roster row, an unproven claim, a narrower grant given back,
-an unhosted window);
+an unhosted window, an aterm serving no contract 4);
 an aterm busy (`ERR` while it shows a dialog, a late reply) or off for now keeping the child
-supervised and claiming later; the claim given back while the policy is off and made again once
-it is on; the claim held with each child announced (`child=`) and a crash relaunched on the
-ladder; a crash passed on when aterm says relaunch is off, waited out while aterm is away and
+supervised and claiming later; no contract-3 claim ever sent, after a busy launch answered `2,3`
+or a restart into `2,3`, and the claim made at 4 once aterm serves it; a crash passed on at once
+once aterm, restarted, serves no 4; the claim given back while
+the policy is off and made again once it is on; the claim held with each child announced
+(`child=`) and a crash relaunched on the ladder; a crash passed on when aterm says relaunch is off, waited out while aterm is away and
 relaunched once the claim is proven again, and passed on once aterm stays away past the budget;
 a crash passed on at once when aterm never admitted the claim; the crash wait's CPU cost while
 aterm is away; keys typed while a crash waits reaching neither the resumed child nor the parent
@@ -722,6 +928,45 @@ publication gate spelled with that `targo`:
   `targo fmt --check` pass, and alab-harness `tools/check-pin` says the checkout carries
   `v0.1.0` exactly. The pin test fails on a byte appended to the copy. The verified lane was
   not rerun on that change.
+  Rerun on 2026-11-14 after `run --` and the launcher's blocks (HX-13a): 69 unit, 52
+  integration and 1 pin test pass; with contract 4 alone on top: 71 unit, 53 integration and 1
+  pin test pass, `targo tippy --locked --workspace --all-targets -- -D warnings` and
+  `targo fmt --check` pass, and alab-harness `tools/check-pin` says the checkout carries `v0.1.0`
+  exactly. `run_takes_the_launchers_double_dash` and `run_sets_the_yolo_default` fail on the
+  previous `src/main.rs`; the byte-for-byte test fails when a default flag's `=value` form is
+  read as a posture marker, as atpkg's `yolo::decide` reads it; the contract tests fail with
+  the guard removed. The verified lane was not rerun on that change.
+  Rerun on 2026-11-14 after the review of those two commits (`run` runs the yolo block with the
+  harness off; the corpus names every word of the block): 72 unit, 53 integration and 1 pin
+  test pass, `targo tippy --locked --workspace --all-targets -- -D warnings` and
+  `targo fmt --check` pass, and alab-harness `tools/check-pin` says the checkout carries `v0.1.0`
+  exactly. `run_sets_the_yolo_default` fails on the previous `src/main.rs`; the byte-for-byte
+  test fails with `--sandbox-network`, `logout` or `--disable-shell` misspelled in
+  `src/launcher.rs`, and `the_table_names_every_word_of_the_block` with `logout`, or the value
+  form of `--permission-profile=`, dropped from its list. The verified lane was not rerun on
+  that change.
+  Rerun on 2026-11-14 on the vendored alab-harness `v0.7.0` (tree `e4c1f87`): with the pin
+  alone (the stream off, the launch's contract read passing `Contract::SPOKEN`) 72 unit, 53
+  integration and 1 pin test pass; with contract 4 declared to `alab-wire` and the guard
+  deleted 72 unit, 53 integration and 1 pin test pass, `targo tippy --locked --workspace
+  --all-targets -- -D warnings` and `targo fmt --check` pass, and alab-harness
+  `tools/check-pin` says the checkout carries `v0.7.0` exactly. Without
+  `Config::with_contracts` in `aterm::config`, `no_contract_3_claim_is_ever_sent`,
+  `the_record_and_the_claim_name_contract_4_alone`,
+  `under_aterm_passes_through_where_no_claim_is_proven` and
+  `under_aterm_no_contract_3_claim_is_ever_sent` fail; without the pass-through on
+  `Failure::Unserved` in `start_under_aterm`, `under_aterm_passes_through_where_no_claim_is_proven`
+  fails (`aterm-contract-3: Muse Code replaced the harness`). The verified lane was not rerun
+  on that change.
+  Rerun on 2026-11-14 after the review of that change (a crash once aterm serves no 4 is passed
+  on at once): 72 unit, 54 integration and 1 pin test pass, `targo tippy --locked --workspace
+  --all-targets -- -D warnings` and `targo fmt --check` pass, and alab-harness
+  `tools/check-pin` says the checkout carries `v0.7.0` exactly. Without the `Failure::Unserved`
+  check in the crash wait, `under_aterm_a_crash_once_aterm_serves_no_4_is_passed_on_at_once`
+  fails (the harness does not exit within 30 s; with the away budget shortened to 12 s the
+  journal says `CRASH-WAIT aterm did not answer (link-lost)` and `NO-RELAUNCH
+  claim-not-proven-again link-lost: aterm did not answer within 12000 ms`). The verified lane
+  was not rerun on that change.
 - `targo tippy --locked --workspace --all-targets -- -D warnings` (which rejects a planted
   `len_zero`) and `targo fmt --check` pass.
 - Every review fix has a test that fails on the first commit (07dd78f) and passes here, and

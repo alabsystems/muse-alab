@@ -238,6 +238,16 @@ const TESTS: &[(&str, bool, fn())] = &[
         no_harness_runs_muse_in_its_place,
     ),
     (
+        "run_takes_the_launchers_double_dash",
+        false,
+        run_takes_the_launchers_double_dash,
+    ),
+    (
+        "run_sets_the_yolo_default",
+        false,
+        run_sets_the_yolo_default,
+    ),
+    (
         "falls_back_when_a_moved_build_passes_help_but_refuses_to_start",
         true,
         falls_back_when_a_moved_build_passes_help_but_refuses_to_start,
@@ -256,6 +266,11 @@ const TESTS: &[(&str, bool, fn())] = &[
         "under_aterm_a_claim_follows_the_policy_off_and_back_on",
         false,
         under_aterm_a_claim_follows_the_policy_off_and_back_on,
+    ),
+    (
+        "under_aterm_no_contract_3_claim_is_ever_sent",
+        false,
+        under_aterm_no_contract_3_claim_is_ever_sent,
     ),
     (
         "under_aterm_holds_the_session_by_a_claim_and_relaunches_on_the_ladder",
@@ -286,6 +301,11 @@ const TESTS: &[(&str, bool, fn())] = &[
         "under_aterm_a_crash_before_aterm_admits_the_claim_is_passed_on_at_once",
         false,
         under_aterm_a_crash_before_aterm_admits_the_claim_is_passed_on_at_once,
+    ),
+    (
+        "under_aterm_a_crash_once_aterm_serves_no_4_is_passed_on_at_once",
+        false,
+        under_aterm_a_crash_once_aterm_serves_no_4_is_passed_on_at_once,
     ),
     (
         "under_aterm_a_waiting_restart_is_refused_when_the_child_crashes",
@@ -1180,6 +1200,138 @@ fn no_harness_runs_muse_in_its_place() {
     }
 }
 
+/// ATPKG'S LAUNCHER RUNS `muse-alab run -- "$@"` once the harness leads `muse` (aterm
+/// `crates/atpkg/src/platform/mod.rs:686`): Muse Code gets exactly the words after that `--`, as
+/// the harness's child, and a launch that names its own posture prints nothing. A `run` without
+/// the launcher's `--` is no launcher's: refused (exit 2), Muse Code never started.
+fn run_takes_the_launchers_double_dash() {
+    let sb = Sandbox::new("run-dashes");
+    sb.point_current(&sb.install(OLD));
+    let err = sb.root.join("stderr");
+    let args: Vec<OsString> = vec![
+        "run".into(),
+        "--".into(),
+        "--trust-workspace".into(),
+        "a b".into(),
+        "".into(),
+        "--".into(),
+        "run".into(),
+        OsString::from_vec(b"\xffz".to_vec()),
+    ];
+    let mut h = sb.spawn_with(&args, &[], &[], Some(File::create(&err).expect("stderr")));
+    let start = h.wait_start(&sb, 1);
+    assert_eq!(
+        field(&start, "argv"),
+        r"[--trust-workspace][a b][][--][run][\xffz]"
+    );
+    assert_eq!(field(&start, "ppid"), h.pid.to_string(), "supervised");
+    sb.send("exit 0");
+    assert_eq!(h.wait_exit(), Exit::Code(0));
+    assert_eq!(fs::read_to_string(&err).expect("stderr"), "");
+    for (name, args) in [
+        ("run-bare", &["run"][..]),
+        ("run-undashed", &["run", "--trust-workspace"]),
+    ] {
+        let sb = Sandbox::new(name);
+        sb.point_current(&sb.install(OLD));
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let mut h = sb.spawn(&args, &[]);
+        assert_eq!(h.wait_exit(), Exit::Code(2), "{name}");
+        h.wait_output("`run` is atpkg's launcher's form, `run -- <muse arguments>`");
+        assert!(sb.starts().is_empty(), "{name}: {:?}", sb.events());
+    }
+}
+
+/// THE YOLO DEFAULT MOVED FROM THE LAUNCHER INTO `run` (aterm's harness interface design §2.1):
+/// with nothing typed that decides the posture, Muse Code starts with every approval and
+/// sandbox off, in front or behind `exec`; a typed `--yolo` spells the same; and stderr carries
+/// the launcher's line byte for byte. A launch that names its own posture, or a first word the
+/// default skips, runs as typed and prints nothing. One that turns the harness off gets the
+/// default all the same, as the launcher's block gives it to `muse --no-harness` (aterm
+/// `platform/mod_sh_shim_tests.rs:790-793`), and runs Muse Code in the harness's place.
+fn run_sets_the_yolo_default() {
+    let flags = "[--disable-approval][--disable-sandbox][--trust-workspace]\
+                 [--disable-request-user-input]";
+    let said = "'--disable-approval' '--disable-sandbox' '--trust-workspace' \
+                '--disable-request-user-input'";
+    // The variables a case adds to the harness's environment.
+    type Vars = &'static [(&'static str, &'static str)];
+    let off: Vars = &[("ATERM_NO_HARNESS", "true")];
+    let cases: [(&str, &[&str], Vars, String, String); 7] = [
+        (
+            "yolo-default",
+            &[],
+            &[],
+            flags.to_string(),
+            format!("aterm: yolo (default): running 'muse' {said}\n"),
+        ),
+        (
+            "yolo-behind-exec",
+            &["exec", "fix it"],
+            &[],
+            format!("[exec]{flags}[fix it]"),
+            format!("aterm: yolo (default): running 'muse' 'exec' {said} 'fix it'\n"),
+        ),
+        (
+            "yolo-typed",
+            &["--yolo", "it's"],
+            &[],
+            format!("{flags}[it's]"),
+            format!("aterm: --yolo: running 'muse' {said} 'it'\\''s'\n"),
+        ),
+        (
+            "yolo-own-posture",
+            &["--approval-mode", "never"],
+            &[],
+            "[--approval-mode][never]".to_string(),
+            String::new(),
+        ),
+        (
+            "yolo-skipped-word",
+            &["skills", "list"],
+            &[],
+            "[skills][list]".to_string(),
+            String::new(),
+        ),
+        (
+            "yolo-no-harness",
+            &["--no-harness", "fix it"],
+            &[],
+            format!("{flags}[fix it]"),
+            format!("aterm: yolo (default): running 'muse' {said} 'fix it'\n"),
+        ),
+        (
+            "yolo-harness-off",
+            &["exec", "x"],
+            off,
+            format!("[exec]{flags}[x]"),
+            format!("aterm: yolo (default): running 'muse' 'exec' {said} 'x'\n"),
+        ),
+    ];
+    for (name, words, env, argv, line) in cases {
+        let sb = Sandbox::new(name);
+        sb.point_current(&sb.install(OLD));
+        let err = sb.root.join("stderr");
+        let args: Vec<OsString> = ["run", "--"]
+            .iter()
+            .chain(words)
+            .map(OsString::from)
+            .collect();
+        let mut h = sb.spawn_with(&args, env, &[], Some(File::create(&err).expect("stderr")));
+        let start = h.wait_start(&sb, 1);
+        assert_eq!(field(&start, "argv"), argv, "{name}");
+        let parent = if name == "yolo-no-harness" || name == "yolo-harness-off" {
+            field(&start, "pid")
+        } else {
+            field(&start, "ppid")
+        };
+        assert_eq!(parent, h.pid.to_string(), "{name}: {start}");
+        sb.send("exit 0");
+        assert_eq!(h.wait_exit(), Exit::Code(0), "{name}");
+        assert_eq!(fs::read_to_string(&err).expect("stderr"), line, "{name}");
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Under aterm: the fake aterm is alab-wire's (feature `fake`), laid for this harness.
 // ---------------------------------------------------------------------------------------
@@ -1224,6 +1376,15 @@ fn claim_of(pid: libc::pid_t) -> String {
     )
 }
 
+/// How many times the harness read aterm's policy (`harness policy`).
+fn policy_reads(aterm: &FakeAterm) -> usize {
+    aterm
+        .verbs()
+        .iter()
+        .filter(|verb| *verb == "harness policy")
+        .count()
+}
+
 /// How many journal lines carry `word` as their event.
 fn notes(journal: &str, word: &str) -> usize {
     journal
@@ -1235,9 +1396,10 @@ fn notes(journal: &str, word: &str) -> usize {
 /// THE FAIL-CLOSED RULE (aterm's harness design §3.2, §8.2): in an aterm tab, wherever aterm
 /// refuses the harness's claim of both duties, Muse Code runs in the harness's place (the same
 /// pid) and the harness says why in its journal: no control socket answers, aterm's window
-/// cannot host a harness (`why=unhosted`), no registry row proves the holder, the claim does not
-/// read back proven under contract 3, the harness has no roster row under contract 3 (it is then
-/// never sent a claim), or aterm granted less than both duties (the claim is given back).
+/// cannot host a harness (`why=unhosted`), no registry row proves the holder, aterm serves no
+/// contract this harness claims at (`2,3`, or 2 alone: it declares 4 alone, so it is never sent
+/// a claim, nor asked for its contract-3 roster row), the claim does not read back proven, or
+/// aterm granted less than both duties (the claim is given back).
 fn under_aterm_passes_through_where_no_claim_is_proven() {
     {
         let sb = Sandbox::new("aterm-no-socket");
@@ -1276,34 +1438,24 @@ fn under_aterm_passes_through_where_no_claim_is_proven() {
             "unproven",
         ),
         (
-            "aterm-unproven-3",
-            |a| {
-                a.serve_contracts(&[2, 3]);
-                a.set_proven(false);
-            },
+            "aterm-contract-3",
+            |a| a.serve_contracts(&[2, 3]),
+            "aterm serves no contract this harness claims at (policy contract=2,3 declared=4)",
+        ),
+        (
+            "aterm-contract-2",
+            |a| a.serve_contracts(&[2]),
+            "aterm serves no contract this harness claims at (policy contract=2 declared=4)",
+        ),
+        (
+            "aterm-unproven",
+            |a| a.set_proven(false),
             "supervisor_proven=0",
         ),
         (
-            "aterm-unrostered-3",
-            |a| {
-                a.serve_contracts(&[2, 3]);
-                a.set_row("muse-alab", &[]);
-                a.set_row("grok-alab", &Scope::CONTRACT_3);
-            },
-            "unrostered",
-        ),
-        (
-            "aterm-narrow-4",
+            "aterm-narrow",
             |a| a.set_known(&[Scope::Upgrade]),
             "aterm granted scope=upgrade (the claim needs relaunch,upgrade)",
-        ),
-        (
-            "aterm-narrow-3",
-            |a| {
-                a.serve_contracts(&[2, 3]);
-                a.set_cap_after_next_claim(Some(&[Scope::Upgrade]));
-            },
-            "supervisor_scope=upgrade",
         ),
     ];
     for (name, lay, says) in cases {
@@ -1327,17 +1479,14 @@ fn under_aterm_passes_through_where_no_claim_is_proven() {
             verbs.iter().any(|v| v == "harness policy"),
             "{name}: {verbs:?}"
         );
-        if name == "aterm-unrostered-3" {
-            assert!(verbs.iter().any(|v| v == "native-act info"), "{verbs:?}");
+        if name.starts_with("aterm-contract-") {
             assert!(
-                claims(&aterm).is_empty(),
-                "a claim was sent off the roster: {verbs:?}"
+                claims(&aterm).is_empty() && !verbs.iter().any(|v| v == "native-act info"),
+                "{name}: an aterm not serving 4 was sent a claim or asked for a roster row: \
+                 {verbs:?}"
             );
         }
-        if matches!(
-            name,
-            "aterm-unproven-3" | "aterm-narrow-4" | "aterm-narrow-3"
-        ) {
+        if matches!(name, "aterm-unproven" | "aterm-narrow") {
             assert!(
                 verbs.contains(&format!("meta unset supervisor holder=muse-alab@{}", h.pid)),
                 "{name}: a claim that does not stand is let go: {verbs:?}"
@@ -1349,13 +1498,13 @@ fn under_aterm_passes_through_where_no_claim_is_proven() {
     }
 }
 
-/// AN aterm THAT IS BUSY, OFF FOR NOW OR NOT YET SERVING A CONTRACT THIS HARNESS CLAIMS AT IS
-/// NOT AWAY: it answered the handshake and then late, said `ERR` to its policy (a dialog up),
-/// has its Autopilot switched off, or serves contract 2 alone. Muse Code runs as the harness's
-/// child (never in its place, unsupervised for the session), nothing is claimed meanwhile, and
-/// the claim is made on the reclaim clock once aterm admits it, naming the child that runs.
+/// AN aterm THAT IS BUSY OR OFF FOR NOW IS NOT AWAY: it answered the handshake and then late,
+/// said `ERR` to its policy (a dialog up), or has its Autopilot switched off. Muse Code runs as
+/// the harness's child (never in its place, unsupervised for the session), nothing is claimed
+/// meanwhile, and the claim is made on the reclaim clock once aterm admits it, naming the child
+/// that runs.
 fn under_aterm_an_aterm_busy_or_off_for_now_keeps_the_child_supervised_and_claims_later() {
-    let cases: [Lifted; 4] = [
+    let cases: [Lifted; 3] = [
         (
             "aterm-busy",
             |a| a.set_reply_delay(Duration::from_millis(900)),
@@ -1378,12 +1527,6 @@ fn under_aterm_an_aterm_busy_or_off_for_now_keeps_the_child_supervised_and_claim
             },
             |a| a.set_policy(POLICY_ON),
             "why=autopilot-off",
-        ),
-        (
-            "aterm-contract-2",
-            |a| a.serve_contracts(&[2]),
-            |a| a.serve_contracts(&[2, 3, 4]),
-            "contract=2",
         ),
     ];
     for (name, lay, lift, says) in cases {
@@ -1422,6 +1565,79 @@ fn under_aterm_an_aterm_busy_or_off_for_now_keeps_the_child_supervised_and_claim
         sb.send("exit 3");
         assert_eq!(h.wait_exit(), Exit::Code(3), "{name}");
     }
+}
+
+/// THE HARNESS NEVER SENDS A CONTRACT-3 CLAIM (the harness proofs' plan, D11; contract 4 declared
+/// to `alab-wire`). A launch whose policy read aterm answered late keeps Muse Code supervised
+/// (above); when aterm then answers serving `2,3`, nothing is claimed on the reclaim clock, and
+/// once it serves 4 the claim is made at 4, naming the child that runs. A claim lost to an aterm
+/// restart into one serving `2,3` is not made again while it does, then made at 4 once aterm
+/// serves it. Neither a claim at 3 nor a contract-3 roster read is ever sent.
+fn under_aterm_no_contract_3_claim_is_ever_sent() {
+    let sb = Sandbox::new("aterm-contract-3-later");
+    sb.point_current(&sb.install(OLD));
+    let aterm = fake_aterm("aterm-contract-3-later");
+    aterm.serve_contracts(&[2, 3]);
+    aterm.set_reply_delay(Duration::from_millis(900));
+    let env = aterm.env();
+    let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+    let first = h.wait_start(&sb, 1);
+    assert_eq!(field(&first, "ppid"), h.pid.to_string(), "supervised");
+    aterm.set_reply_delay(Duration::ZERO);
+    let unserved = " UNCLAIMED policy contract=2,3 declared=4";
+    h.wait_until(&sb, "aterm's 2,3 answer on the reclaim clock", |sb| {
+        sb.journal().contains(unserved)
+    });
+    let reads = policy_reads(&aterm);
+    h.wait_until(&sb, "one more reclaim under 2,3", |_| {
+        policy_reads(&aterm) > reads
+    });
+    assert!(claims(&aterm).is_empty(), "{:?}", aterm.verbs());
+    aterm.serve_contracts(&[2, 3, 4]);
+    h.wait_until(&sb, "the claim at 4 once aterm serves it", |sb| {
+        notes(&sb.journal(), "CLAIMED") >= 1
+    });
+    let child = field(&first, "pid");
+    assert!(
+        claims(&aterm)
+            .iter()
+            .any(|c| c.starts_with(&claim_of(h.pid)) && c.contains(&format!(" child={child}:"))),
+        "claimed at 4 with the child that runs: {:?}",
+        claims(&aterm)
+    );
+
+    // aterm restarts into one serving `2,3` (served first, so the restart is the only loss).
+    aterm.serve_contracts(&[2, 3]);
+    aterm.restart();
+    h.wait_until(&sb, "the claim lost to the restart", |sb| {
+        notes(&sb.journal(), "LOST") >= 1
+    });
+    let lost = sb.journal().len();
+    h.wait_until(&sb, "aterm's 2,3 answer after the restart", |sb| {
+        sb.journal()[lost..].contains(unserved)
+    });
+    let reads = policy_reads(&aterm);
+    h.wait_until(&sb, "one more reclaim under 2,3", |_| {
+        policy_reads(&aterm) > reads
+    });
+    assert_eq!(aterm.holder(), None, "{:?}", aterm.verbs());
+    aterm.serve_contracts(&[2, 3, 4]);
+    h.wait_until(&sb, "the claim made again at 4", |sb| {
+        notes(&sb.journal(), "CLAIMED") >= 2
+    });
+    assert_eq!(aterm.holder(), Some(format!("muse-alab@{}", h.pid)));
+    let made = claims(&aterm);
+    assert!(
+        made.iter().all(|c| c.starts_with(&claim_of(h.pid))),
+        "every claim at 4: {made:?}"
+    );
+    assert!(
+        !aterm.verbs().iter().any(|v| v == "native-act info"),
+        "{:?}",
+        aterm.verbs()
+    );
+    sb.send("exit 3");
+    assert_eq!(h.wait_exit(), Exit::Code(3));
 }
 
 /// A CLAIM FOLLOWS aterm's POLICY: switched off (here the session's Autopilot), it is given
@@ -1717,6 +1933,69 @@ fn under_aterm_a_crash_before_aterm_admits_the_claim_is_passed_on_at_once() {
     );
     assert!(!j.contains(" CRASH-WAIT "), "{j}");
     assert!(claims(&aterm).is_empty(), "{:?}", aterm.verbs());
+}
+
+/// A CRASH ONCE aterm SERVES NO 4 is passed on at once (`NO-RELAUNCH aterm's word: policy
+/// contract=2,3 declared=4`): a claim at 4 is lost to an aterm restart into one serving `2,3`,
+/// and aterm answers every claim made again that it serves no contract this harness declares,
+/// its last word on the lost link (`Failure::Unserved`), so the crash does not wait out the 45 s
+/// away budget as though aterm were away. It holds for a crash after that answer and for one in
+/// the 5 s before it, which the crash wait's own reclaim answers. Nothing is relaunched, and the
+/// claim is never made again (NEGATIVE CONTROL: before, the crash waited the whole budget,
+/// `CRASH-WAIT aterm did not answer (link-lost)`, then `NO-RELAUNCH claim-not-proven-again`).
+fn under_aterm_a_crash_once_aterm_serves_no_4_is_passed_on_at_once() {
+    let unserved = "policy contract=2,3 declared=4";
+    for (scene, answered) in [
+        ("aterm-unserved-crash", true),
+        ("aterm-unserved-early-crash", false),
+    ] {
+        let sb = Sandbox::new(scene);
+        sb.point_current(&sb.install(OLD));
+        let aterm = fake_aterm(scene);
+        let env = aterm.env();
+        let mut h = sb.spawn(&["--trust-workspace".into()], &pairs(&env));
+        h.wait_start(&sb, 1);
+        h.wait_until(&sb, "the claim and its announcement", |_| {
+            claims(&aterm).len() >= 2
+        });
+        // Served first, so the restart is the only loss.
+        aterm.serve_contracts(&[2, 3]);
+        aterm.restart();
+        h.wait_until(&sb, "the claim lost to the restart", |sb| {
+            notes(&sb.journal(), "LOST") >= 1
+        });
+        let made = claims(&aterm).len();
+        if answered {
+            h.wait_until(&sb, "aterm's 2,3 answer after the restart", |sb| {
+                sb.journal().contains(&format!(" UNCLAIMED {unserved}"))
+            });
+        }
+        let crashed = Instant::now();
+        sb.send("crash-exit 101");
+        assert_eq!(h.wait_exit(), Exit::Code(101), "{scene}");
+        let took = crashed.elapsed();
+        assert!(
+            took < Duration::from_secs(15),
+            "{scene}: the crash was passed on {took:?} after it, inside the 45 s away budget"
+        );
+        assert_eq!(sb.starts().len(), 1, "{scene}: nothing relaunched");
+        let j = sb.journal();
+        assert!(
+            j.contains(&format!("NO-RELAUNCH aterm's word: {unserved}")),
+            "{scene}: {j}"
+        );
+        assert!(!j.contains("claim-not-proven-again"), "{scene}: {j}");
+        if answered {
+            assert!(!j.contains(" CRASH-WAIT "), "{scene}: {j}");
+        }
+        assert_eq!(
+            claims(&aterm).len(),
+            made,
+            "{scene}: no claim made again: {:?}",
+            aterm.verbs()
+        );
+        assert_eq!(aterm.holder(), None, "{scene}");
+    }
 }
 
 /// A CRASH IS PASSED ON once aterm stays away past the away budget (shortened to 1.5 s here, 45 s

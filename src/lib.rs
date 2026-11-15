@@ -7,6 +7,9 @@
 //! closed binary, installed by atpkg) as its child on the inherited terminal. It never
 //! ships, forks or patches vendor bytes. What it adds:
 //!
+//! - run by atpkg's launcher (`muse-alab run -- <muse arguments>`), it does what the launcher
+//!   did for the word `muse` before Muse Code starts: the yolo default, byte for byte
+//!   ([`launcher`]);
 //! - it finds the vendor binary in the atpkg store only ([`store`]), never through `PATH`
 //!   or the `agents/` twin, refuses a store binary that is itself, and marks every process
 //!   it starts as the vendor ([`env::child_marks`]) so that a harness started by a harness
@@ -19,7 +22,7 @@
 //! - it relaunches a crashed child on its session after aterm's back-off ladder's pause, and
 //!   restarts it on the same session when aterm asks ([`supervise`]);
 //! - under aterm it holds the session through a claim of both its duties
-//!   (`muse-alab@<pid> scope=relaunch,upgrade`, at contract 4 or 3) made by the shared
+//!   (`muse-alab@<pid> scope=relaunch,upgrade`, at contract 4, never 3) made by the shared
 //!   aterm client `alab-wire` ([`aterm`]), every act waiting on a fresh read of aterm, and
 //!   gets out of the way (Muse Code `exec`ed in its place) wherever aterm refuses that claim;
 //! - it moves itself onto a newer build of the harness the same way: at the same safe point it
@@ -33,6 +36,7 @@ pub mod env;
 pub mod gate;
 pub mod journal;
 pub mod json;
+pub mod launcher;
 pub mod muse;
 pub mod probe;
 pub mod procs;

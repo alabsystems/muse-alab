@@ -1,11 +1,11 @@
 # What aterm knows about this harness. `atpkg-publish pack` copies the [harness] table into the
 # package's signed manifest; aterm makes a registry row from it only when that manifest verifies
 # (aterm docs/DESIGN-harness-interface-2026-11-12.md §2.1). The publisher refuses unknown keys.
-# Every value restates aterm's compiled seed row for muse-alab and never widens it.
+# Every value but `contracts` restates aterm's compiled seed row for muse-alab and none widens it.
 [harness]
 id        = "muse-alab"
 tool      = "muse-alab"
 leads     = []
-contracts = [3, 4]            # alab-wire claims at 4 where aterm serves it, else at 3
+contracts = [4]               # never 3, the seed rows' alone (src/aterm.rs CONTRACTS declares it to alab-wire)
 name      = "Muse Code"
 env_strip = []                # aterm's default strip list holds no Muse prefix

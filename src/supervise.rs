@@ -22,7 +22,8 @@
 //!   it ran. Under aterm the relaunch waits on aterm's word ([`Harness::crash_wait`]), up to
 //!   aterm's 45 s while aterm is away or answers only later; a `SIGINT`, `SIGQUIT`, `SIGHUP`
 //!   or `SIGTERM` meanwhile passes the crash on, and keys typed meanwhile are dropped. In a tab
-//!   where aterm never admitted a claim of this harness's, the crash is passed on at once.
+//!   where aterm never admitted a claim of this harness's, or once aterm answered a claim made
+//!   again that it serves no contract this harness declares, the crash is passed on at once.
 //! - A restart aterm asks the claim holder for (`restart cause=asked|stall`, a person's
 //!   `aterm ctl restart` or the stall's remedy) ends the child with `SIGTERM` (and `SIGKILL`
 //!   if it does not end, as aterm's own restart does) and resumes the same session, on the
@@ -46,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use alab_wire::link::LATER_RETRY_MS;
 use alab_wire::relaunch::{AWAY_BUDGET, AwayBudget, ChildEnd, Ladder, abnormal_exit};
-use alab_wire::{Child, ChildProcess, Link, Relaunch, Restart};
+use alab_wire::{Child, ChildProcess, Failure, Link, Relaunch, Restart};
 
 use crate::adopt::{self, Carried};
 use crate::child::{self, End, Status};
@@ -1636,6 +1637,9 @@ impl Harness {
     /// answering only later is asked again every second, within [`Config::away_budget`] of time
     /// actually spent waiting for it: in a tab this harness leads, no built-in lane of aterm's
     /// brings the child back, so a crash passed on at once would leave the session to nobody.
+    /// A lost link whose claim aterm last answered serving no contract this harness declares
+    /// (`Failure::Unserved` in `Link::unclaimed`, after an aterm restart into `2,3`) is not
+    /// away: that answer is aterm's last word on the link, and it passes the crash on at once.
     /// Outside aterm only the pause is waited. Restarts aterm asks for meanwhile are refused (no
     /// child runs to restart), and a `SIGINT`, `SIGQUIT`, `SIGHUP` or `SIGTERM` (or
     /// `interrupted`) passes the crash on: whoever sends one wants the session over.
@@ -1690,6 +1694,15 @@ impl Harness {
                     }
                     Relaunch::Denied(why) => return Err(format!("aterm's word: {why}")),
                     Relaunch::Away(why) | Relaunch::Later(why) => {
+                        // `relaunch_word` answers every lost link `Away`, but one whose claim
+                        // made again aterm answered serving no contract this harness declares
+                        // has aterm's last word, not its absence: no hold aterm stated stands
+                        // over it, and no claim can be made until an aterm update, which comes
+                        // as another restart. In the first 5 s after a loss nothing has been
+                        // asked yet, and the wait's own tick makes the attempt.
+                        if let Some(Failure::Unserved(word)) = self.link.unclaimed() {
+                            return Err(format!("aterm's word: {word}"));
+                        }
                         if budget.wait(ms) {
                             self.journal.note(
                                 "CRASH-WAIT",
